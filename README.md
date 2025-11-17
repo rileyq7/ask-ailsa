@@ -11,6 +11,13 @@ AI-powered grant discovery platform for UK research funding from NIHR and Innova
 - **Grant Recommendations**: Relevance-ranked results with scores and metadata
 - **Smart Filtering**: Filter by deadline, funding amount, eligibility, and more
 
+### SME Knowledge System
+- **Expert Examples Database**: SQLite database storing SME curator expertise
+- **Auto-Monitor Slack Bot**: Captures expert knowledge from Slack automatically
+- **Quality Scoring**: Auto-assesses examples on 1-5 star scale
+- **Multi-Format Capture**: Text, web links, PDFs, and Word documents
+- **AI Integration**: Top examples injected into LLM prompts for better responses
+
 ### Data Extraction
 - **Competition Metadata Extraction**: Titles, dates, funding rules, project sizes
 - **Section Parsing**: Logical sections with fragment URLs (eligibility, scope, dates, etc.)
@@ -41,6 +48,17 @@ The API will be available at `http://localhost:8000`
 ```
 
 The UI will open automatically in your browser at `http://localhost:8501`
+
+### 3. Start the Slack Bot (Optional)
+
+Monitor your SME Slack channel for expert knowledge:
+
+```bash
+cd slack
+./start_slack_bot.sh
+```
+
+The bot will auto-capture messages in `#sme-knowledge` without requiring @mentions. See [Slack Bot Setup](#slack-bot-setup) for configuration.
 
 ### Using Ask Ailsa
 
@@ -104,20 +122,53 @@ for doc in docs:
 
 ```
 .
+├── README.md                # This file
 ├── requirements.txt         # Python dependencies
-├── README.md               # This file
-├── src/
+├── .env                     # API configuration
+├── grants.db               # SQLite database (grants + expert examples)
+│
+├── src/                    # Core application
+│   ├── api/
+│   │   └── server.py       # FastAPI backend with streaming
 │   ├── core/
-│   │   ├── models.py       # Data models (Competition, Section, Resource, Document)
-│   │   └── utils.py        # Utility functions (hashing, date parsing, etc.)
+│   │   ├── models.py       # Data models
+│   │   └── utils.py        # Utility functions
 │   ├── ingest/
-│   │   ├── innovatuk_types.py          # Container types
 │   │   ├── innovateuk_competition.py   # Competition scraper
-│   │   └── resource_ingestor.py        # Resource fetcher and parser
+│   │   └── resource_ingestor.py        # Resource fetcher
 │   └── scripts/
-│       └── scrape_innovateuk_demo.py   # Demo script
-└── tests/
-    └── (test files)
+│       ├── run_api.py                  # API startup script
+│       └── scrape_innovateuk_demo.py   # Scraper demo
+│
+├── ui/                     # Streamlit frontend
+│   ├── app.py             # Main UI application
+│   └── requirements.txt   # UI-specific dependencies
+│
+├── slack/                 # SME Knowledge Slack Bot
+│   ├── sme_slack_bot.py          # Auto-monitoring Slack bot
+│   ├── start_slack_bot.sh        # Bot launcher
+│   ├── .env.slack               # Slack configuration
+│   └── requirements-slack.txt   # Slack dependencies
+│
+├── scripts/               # Expert examples management
+│   ├── create_expert_examples_table.py
+│   ├── add_expert_example.py
+│   ├── import_one_pager.py
+│   ├── convert_docx_to_txt.py
+│   └── view_expert_examples.py
+│
+├── tests/                 # Test suite
+│   ├── test_basic_functionality.py
+│   ├── test_nihr_scraper.py
+│   ├── test_slack_connection.py
+│   └── debug_slack_bot.py
+│
+├── sme_curations/         # Expert one-pager examples
+│
+└── Launcher scripts
+    ├── start_api.sh       # Start backend API
+    ├── start_ui.sh        # Start Streamlit UI
+    └── start.sh           # Start all services
 ```
 
 ## Data Models
@@ -150,12 +201,69 @@ Resources are automatically classified based on URL patterns:
 - General UKRI/Innovate UK guidance pages
 - Resources not specific to a single competition
 
+## Slack Bot Setup
+
+The Slack bot auto-monitors your SME channel and captures expert knowledge to improve AI responses.
+
+### Initial Setup
+
+1. **Install dependencies**:
+   ```bash
+   cd slack
+   pip3 install -r requirements-slack.txt
+   ```
+
+2. **Configure Slack tokens** in `slack/.env.slack`:
+   ```bash
+   SLACK_BOT_TOKEN=xoxb-your-bot-token
+   SLACK_APP_TOKEN=xapp-your-app-token
+   SME_CHANNEL=sme-knowledge
+   ```
+
+3. **Create Slack App** at https://api.slack.com/apps
+   - Enable Socket Mode
+   - Add OAuth scopes: `channels:history`, `channels:read`, `chat:write`, `reactions:write`
+   - Enable Event Subscriptions: Add `message.channels` bot event
+   - Install to workspace
+
+4. **Start the bot**:
+   ```bash
+   cd slack
+   ./start_slack_bot.sh
+   ```
+
+### Bot Features
+
+- **Auto-Monitoring**: Processes ALL messages (no @mention required)
+- **Multi-Format**: Captures text, web links, PDFs, and Word documents
+- **Quality Scoring**: Auto-assesses 1-5 stars based on content
+- **Smart Detection**: Identifies grant names, categories, and strategies
+- **Deduplication**: Prevents duplicate processing
+- **Status Command**: Use `/sme-status` in Slack to see stats
+
+### Managing Expert Examples
+
+View captured examples:
+```bash
+python3 scripts/view_expert_examples.py
+```
+
+Add manual example:
+```bash
+python3 scripts/add_expert_example.py
+```
+
+Import from one-pager documents:
+```bash
+python3 scripts/import_one_pager.py sme_curations/example.txt
+```
+
 ## Testing
 
 ### Test Core Functionality
 
 ```bash
-python3 test_basic_functionality.py
+python3 tests/test_basic_functionality.py
 ```
 
 This tests:
@@ -163,6 +271,14 @@ This tests:
 - Data model creation
 - Scraper components (ID extraction, scope classification, type inference)
 - Resource ingestor components
+
+### Test Slack Bot
+
+```bash
+python3 tests/debug_slack_bot.py
+```
+
+Checks authentication, channel access, and permissions.
 
 ### Unit Tests
 

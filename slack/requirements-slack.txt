@@ -1,0 +1,21 @@
+# Slack Bot Dependencies
+
+# Core Slack integration
+slack-bolt>=1.18.0
+slack-sdk>=3.23.0
+
+# Web scraping
+requests>=2.31.0
+beautifulsoup4>=4.12.2
+lxml>=4.9.3
+
+# Document processing
+PyPDF2>=3.0.1
+python-docx>=1.0.1
+
+# Optional: Advanced features (install separately if needed)
+# pdfplumber>=0.9.0  # Better PDF extraction with tables
+# openpyxl>=3.1.2    # Excel files
+# python-pptx>=0.6.21  # PowerPoint files
+# Pillow>=10.0.0     # Image processing
+# pytesseract>=0.3.10  # OCR (requires system tesseract)

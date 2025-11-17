@@ -159,9 +159,21 @@ def ask_ailsa_stream(user_prompt: str) -> Iterable[Dict]:
     """
     try:
         logger.info(f"Sending request to {STREAM_ENDPOINT}")
+
+        # Build conversation history from session state (last 10 messages = 5 exchanges)
+        history = []
+        for msg in st.session_state.messages[-10:]:
+            if msg["role"] in ["user", "assistant"]:
+                history.append({
+                    "role": msg["role"],
+                    "content": msg["content"]
+                })
+
+        logger.info(f"Sending {len(history)} historical messages for context")
+
         response = requests.post(
             STREAM_ENDPOINT,
-            json={"message": user_prompt, "history": [], "active_only": True, "sources": None},
+            json={"message": user_prompt, "history": history, "active_only": True, "sources": None},
             stream=True,
             timeout=120,
             headers={"Accept": "text/event-stream"},  # Explicitly request SSE

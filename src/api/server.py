@@ -86,6 +86,82 @@ chat_llm_client = None
 
 
 # -----------------------------------------------------------------------------
+# Expert Examples Functions
+# -----------------------------------------------------------------------------
+
+def get_expert_examples(category: str = None, limit: int = 3, min_quality: int = 4):
+    """
+    Retrieve expert examples from database.
+
+    Args:
+        category: Filter by category (optional)
+        limit: Max number of examples to return
+        min_quality: Minimum quality score (1-5)
+
+    Returns:
+        List of expert example dicts
+    """
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+
+    if category:
+        cur.execute("""
+            SELECT user_query, expert_response, category, grant_mentioned, client_context
+            FROM expert_examples
+            WHERE category = ? AND is_active = 1 AND quality_score >= ?
+            ORDER BY quality_score DESC, added_date DESC
+            LIMIT ?
+        """, (category, min_quality, limit))
+    else:
+        cur.execute("""
+            SELECT user_query, expert_response, category, grant_mentioned, client_context
+            FROM expert_examples
+            WHERE is_active = 1 AND quality_score >= ?
+            ORDER BY quality_score DESC, added_date DESC
+            LIMIT ?
+        """, (min_quality, limit))
+
+    examples = []
+    for row in cur.fetchall():
+        examples.append({
+            "user_query": row[0],
+            "expert_response": row[1],
+            "category": row[2],
+            "grant_mentioned": row[3],
+            "client_context": row[4]
+        })
+
+    conn.close()
+    return examples
+
+
+def format_expert_examples_for_prompt(examples: list) -> str:
+    """Format expert examples for inclusion in system prompt."""
+    if not examples:
+        return ""
+
+    formatted = "\n---EXPERT RESPONSE EXAMPLES---\n\n"
+    formatted += "Learn from these examples of how to respond:\n\n"
+
+    for i, ex in enumerate(examples, 1):
+        formatted += f"EXAMPLE {i}"
+        if ex['category']:
+            formatted += f" ({ex['category']})"
+        if ex['grant_mentioned']:
+            formatted += f" - {ex['grant_mentioned']}"
+        formatted += "\n\n"
+
+        if ex['client_context']:
+            formatted += f"Client context: {ex['client_context']}\n\n"
+
+        formatted += f"User Query: {ex['user_query']}\n\n"
+        formatted += f"Expert Response:\n{ex['expert_response'][:800]}...\n\n"
+        formatted += "---\n\n"
+
+    return formatted
+
+
+# -----------------------------------------------------------------------------
 # Utility Functions
 # -----------------------------------------------------------------------------
 
@@ -393,16 +469,16 @@ def select_top_grants(hits, query: str = ""):
         max_grants = 5
         logger.info(f"User requested comprehensive list, showing up to {max_grants} grants")
 
-    # Prioritize open grants but include 1-2 closed if we have few open grants
+    # Prioritize open grants - only show closed if very few open options
     relevant = open_grants[:max_grants]
 
-    # Only add closed grants if we have fewer than 3 open grants
-    if len(relevant) < 3 and closed_grants:
-        # Add up to 2 closed grants to provide context
-        relevant.extend(closed_grants[:2])
-        relevant = relevant[:max_grants]  # Ensure we don't exceed max
+    # Only add closed grants if we have 1 or fewer open grants (desperate measure)
+    if len(relevant) <= 1 and closed_grants:
+        # Add up to 1 closed grant as context only
+        relevant.extend(closed_grants[:1])
+        logger.info(f"⚠️ Added {len(closed_grants[:1])} closed grant(s) due to limited open options")
 
-    logger.info(f"Selected {len(open_grants)} open and {len(closed_grants)} closed grants, returning {len(relevant)} total")
+    logger.info(f"Selected {len(open_grants)} open and {len(closed_grants)} closed grants, returning {len(relevant)} total (open only: {len([g for g in relevant if g in open_grants])})")
 
     return relevant
 
@@ -813,13 +889,13 @@ def parse_company_website(url: str) -> Optional[dict]:
         title = soup.find('title')
         title_text = title.text.strip() if title else ''
 
-        # Extract main body text (first 1000 chars)
+        # Extract main body text (first 2000 chars for better context)
         # Remove script and style elements
         for script in soup(["script", "style"]):
             script.decompose()
 
         body_text = soup.get_text(separator=' ', strip=True)
-        body_text = ' '.join(body_text.split())[:1000]
+        body_text = ' '.join(body_text.split())[:2000]
 
         # Combine for context
         full_text = f"{title_text} {description} {body_text}"
@@ -830,7 +906,16 @@ def parse_company_website(url: str) -> Optional[dict]:
         # Try to detect company stage
         stage = detect_company_stage(full_text)
 
-        logger.info(f"✓ Parsed website: {url} - Found {len(keywords)} keywords, stage: {stage}")
+        # Detect sector/domain
+        sector = detect_sector_from_text(full_text)
+
+        # Detect TRL indicators
+        trl_estimate = estimate_trl_from_text(full_text)
+
+        # Suggest likely grant matches based on content
+        suggested_grants = suggest_grants_from_context(full_text, keywords, sector)
+
+        logger.info(f"✓ Parsed {url}: sector={sector}, stage={stage}, TRL~{trl_estimate}, grants={suggested_grants}")
 
         return {
             'url': url,
@@ -838,6 +923,9 @@ def parse_company_website(url: str) -> Optional[dict]:
             'description': description,
             'keywords': keywords,
             'stage': stage,
+            'sector': sector,
+            'trl_estimate': trl_estimate,
+            'suggested_grants': suggested_grants,
             'full_context': full_text[:500]
         }
 
@@ -880,6 +968,111 @@ def extract_keywords(text: str) -> list:
     return list(set(found))[:10]  # Return up to 10 unique keywords
 
 
+def detect_sector_from_text(text: str) -> str:
+    """
+    Detect primary sector from website text.
+
+    Args:
+        text: Website text
+
+    Returns:
+        Detected sector or 'general'
+    """
+    text_lower = text.lower()
+
+    # Health/medical sectors
+    if any(term in text_lower for term in ['medical device', 'medtech', 'healthcare', 'clinical', 'diagnostic', 'therapeutics']):
+        return 'medtech'
+    elif any(term in text_lower for term in ['biotech', 'drug discovery', 'pharmaceutical', 'gene therapy']):
+        return 'biotech'
+    elif any(term in text_lower for term in ['digital health', 'healthtech', 'telemedicine', 'remote monitoring']):
+        return 'digital health'
+
+    # Tech sectors
+    elif any(term in text_lower for term in ['artificial intelligence', 'machine learning', 'ai platform', 'llm']):
+        return 'ai'
+    elif any(term in text_lower for term in ['software', 'saas', 'platform', 'api']):
+        return 'software'
+
+    # Engineering/materials
+    elif any(term in text_lower for term in ['materials science', 'advanced materials', 'composites']):
+        return 'materials'
+    elif any(term in text_lower for term in ['manufacturing', 'automation', 'robotics']):
+        return 'manufacturing'
+
+    # Other sectors
+    elif any(term in text_lower for term in ['clean tech', 'renewable', 'sustainability', 'carbon']):
+        return 'cleantech'
+    elif any(term in text_lower for term in ['fintech', 'financial technology', 'payments']):
+        return 'fintech'
+
+    return 'general'
+
+
+def estimate_trl_from_text(text: str) -> str:
+    """
+    Estimate Technology Readiness Level from website text.
+
+    Args:
+        text: Website text
+
+    Returns:
+        TRL estimate or 'unknown'
+    """
+    text_lower = text.lower()
+
+    # High TRL (7-9) - Commercial/market indicators
+    if any(term in text_lower for term in ['available now', 'buy now', 'customers', 'in production', 'commercially available']):
+        return '7-9'
+
+    # Mid TRL (4-6) - Prototype/validation indicators
+    elif any(term in text_lower for term in ['pilot', 'prototype', 'clinical trial', 'validation', 'demonstrator']):
+        return '4-6'
+
+    # Low TRL (1-3) - Research/concept indicators
+    elif any(term in text_lower for term in ['research', 'concept', 'feasibility', 'proof of concept', 'early stage']):
+        return '1-3'
+
+    return 'unknown'
+
+
+def suggest_grants_from_context(text: str, keywords: list, sector: str) -> list:
+    """
+    Suggest likely grant matches based on company context.
+
+    Args:
+        text: Full website text
+        keywords: Extracted keywords
+        sector: Detected sector
+
+    Returns:
+        List of suggested grant types
+    """
+    text_lower = text.lower()
+    suggestions = []
+
+    # NIHR grants
+    if sector in ['medtech', 'biotech', 'digital health']:
+        if 'clinical' in text_lower or 'nhs' in text_lower or 'patient' in text_lower:
+            suggestions.append('NIHR i4i')
+        if 'research' in text_lower:
+            suggestions.append('NIHR Research')
+
+    # Innovate UK grants
+    if sector in ['ai', 'software', 'manufacturing', 'materials', 'cleantech']:
+        suggestions.append('Innovate UK sector competitions')
+
+    # Biomedical Catalyst (cross-over)
+    if sector in ['medtech', 'biotech', 'digital health'] and any(term in text_lower for term in ['commercial', 'market', 'product']):
+        suggestions.append('Biomedical Catalyst')
+
+    # KTP if mentions partnerships/collaboration
+    if any(term in text_lower for term in ['university', 'research partner', 'collaboration', 'academic']):
+        suggestions.append('Knowledge Transfer Partnership')
+
+    return suggestions[:3]  # Top 3 suggestions
+
+
 def detect_company_stage(text: str) -> str:
     """
     Detect company stage from website text.
@@ -908,6 +1101,383 @@ def detect_company_stage(text: str) -> str:
         return 'established'
 
     return 'unknown'
+
+
+def analyze_query_intent(query: str) -> str:
+    """
+    Figure out what stage/intent the user has.
+
+    Args:
+        query: User query text
+
+    Returns:
+        Intent category string
+    """
+    query_lower = query.lower()
+
+    # Early exploration
+    if any(word in query_lower for word in ['what', 'which', 'options', 'available']):
+        return "exploring_options"
+
+    # Specific grant questions
+    if any(word in query_lower for word in ['deadline', 'how much', 'criteria', 'eligible']):
+        return "specific_requirements"
+
+    # Strategy questions
+    if any(word in query_lower for word in ['how to', 'tips', 'advice', 'strategy']):
+        return "seeking_strategy"
+
+    # Technical/stage questions
+    if 'trl' in query_lower or 'stage' in query_lower:
+        return "technical_readiness"
+
+    # Comparison
+    if any(word in query_lower for word in ['vs', 'versus', 'or', 'better']):
+        return "comparing_options"
+
+    return "general_inquiry"
+
+
+def adjust_temperature_for_conversation(conversation_length: int, user_message_length: int) -> float:
+    """
+    Adjust temperature based on conversation dynamics to match user's communication style.
+
+    Args:
+        conversation_length: Number of messages in conversation
+        user_message_length: Length of current user message
+
+    Returns:
+        Appropriate temperature value
+    """
+    # If user writes short messages, be more focused
+    if user_message_length < 50:
+        return 0.5  # More focused, less variation
+
+    # If deep in conversation, be more brief and precise
+    if conversation_length > 10:
+        return 0.4  # Avoid repetition, stay focused
+
+    # First few messages can be warmer and more exploratory
+    if conversation_length < 3:
+        return 0.7  # More natural variation
+
+    return 0.6  # Default balanced
+
+
+def format_known_facts(facts: dict) -> str:
+    """
+    Format known facts into a readable string for the prompt.
+
+    Args:
+        facts: Dictionary of known facts
+
+    Returns:
+        Formatted string of known facts
+    """
+    known = []
+    if facts.get('trl'):
+        known.append(f"TRL: {facts['trl']}")
+    if facts.get('budget'):
+        known.append(f"Budget: {facts['budget']}")
+    if facts.get('sector'):
+        known.append(f"Sector: {facts['sector']}")
+    if facts.get('company_type'):
+        known.append(f"Company type: {facts['company_type']}")
+    if facts.get('stage'):
+        known.append(f"Stage: {facts['stage']}")
+    if facts.get('timeline'):
+        known.append(f"Timeline: {facts['timeline']}")
+    if facts.get('clinical_champion'):
+        known.append("Has clinical champion")
+
+    if not known:
+        return "None yet - this is a fresh conversation"
+
+    return ", ".join(known)
+
+
+class GrantMentionDetector:
+    """Detect and track grant mentions in real-time responses."""
+
+    def __init__(self, grant_store):
+        self.grant_store = grant_store
+
+        # Common grant name patterns and aliases
+        self.grant_aliases = {
+            'i4i': ['i4i', 'invention for innovation', 'i4i pda', 'i4i product development'],
+            'biomedical_catalyst': ['biomedical catalyst', 'biomed catalyst', 'bmc'],
+            'smart_grants': ['smart grants', 'smart grant'],
+            'innovation_loans': ['innovation loan', 'innovate uk loan'],
+            'ktp': ['ktp', 'knowledge transfer partnership'],
+            'sbri': ['sbri', 'small business research initiative'],
+        }
+
+    def extract_grant_mentions(self, text: str, available_grants: list = None) -> list:
+        """
+        Find all grant mentions in text and match to actual grants.
+
+        Args:
+            text: Response text to analyze
+            available_grants: List of grants from search results
+
+        Returns:
+            List of matched grant objects
+        """
+        mentioned_grants = []
+        text_lower = text.lower()
+
+        # First, check available grants from search results
+        if available_grants:
+            for grant in available_grants:
+                grant_title = grant.get('title', '').lower()
+                # Check if grant title is mentioned in response
+                if len(grant_title) > 10 and grant_title in text_lower:
+                    if grant not in mentioned_grants:
+                        mentioned_grants.append(grant)
+
+        # Then check for common aliases
+        for grant_key, aliases in self.grant_aliases.items():
+            for alias in aliases:
+                if alias.lower() in text_lower:
+                    # Try to find matching grant from available_grants
+                    if available_grants:
+                        for grant in available_grants:
+                            grant_title_lower = grant.get('title', '').lower()
+                            # Match alias to grant title
+                            if grant_key in grant_title_lower or any(a in grant_title_lower for a in aliases):
+                                if grant not in mentioned_grants:
+                                    mentioned_grants.append(grant)
+                                    break
+
+        return mentioned_grants[:5]  # Max 5 grant cards
+
+
+def validate_and_correct_trl(query: str) -> dict:
+    """
+    Validate TRL mentioned in query and provide correction if invalid.
+
+    Args:
+        query: User query text
+
+    Returns:
+        Dict with validation result and optional correction
+    """
+    trl_match = re.search(r'trl\s*(\d+)', query.lower())
+    if trl_match:
+        try:
+            trl = int(trl_match.group(1))
+
+            if trl > 9:
+                return {
+                    'valid': False,
+                    'trl': None,
+                    'correction': f"Quick note - TRL only goes up to 9 (market deployment). "
+                                 f"If you meant TRL {min(trl % 10, 9)}, that's already commercial stage. "
+                                 f"What's your actual development status?"
+                }
+            elif trl < 1:
+                return {
+                    'valid': False,
+                    'trl': None,
+                    'correction': "TRL starts at 1 (basic research). Where are you really at?"
+                }
+            else:
+                return {'valid': True, 'trl': trl, 'correction': None}
+        except ValueError:
+            pass
+
+    return {'valid': True, 'trl': None, 'correction': None}
+
+
+def extract_conversation_facts(history: list) -> dict:
+    """
+    Track key facts already shared in conversation to avoid asking twice.
+
+    Args:
+        history: List of conversation messages
+
+    Returns:
+        Dictionary of known facts
+    """
+    facts = {
+        'trl': None,
+        'budget': None,
+        'company_type': None,
+        'clinical_champion': None,
+        'timeline': None,
+        'partnerships': [],
+        'sector': None,
+        'stage': None
+    }
+
+    if not history:
+        return facts
+
+    for turn in history:
+        content = turn.content.lower()
+
+        # Track TRL (with validation)
+        if 'trl' in content:
+            trl_match = re.search(r'trl\s*(\d+)', content)
+            if trl_match:
+                try:
+                    trl = int(trl_match.group(1))
+                    # Only store valid TRL values (1-9)
+                    if 1 <= trl <= 9:
+                        facts['trl'] = trl
+                except ValueError:
+                    pass
+
+        # Track budget
+        if '£' in content:
+            budget_match = re.search(r'£([\d,]+)([km])?', content)
+            if budget_match:
+                facts['budget'] = budget_match.group(0)
+
+        # Track company type
+        if 'sme' in content or 'small medium enterprise' in content:
+            facts['company_type'] = 'SME'
+        elif 'startup' in content or 'start-up' in content:
+            facts['company_type'] = 'startup'
+
+        # Track clinical champion
+        if 'clinical champion' in content or 'clinical lead' in content:
+            facts['clinical_champion'] = True
+
+        # Track timeline/urgency
+        if 'urgent' in content or 'asap' in content or 'quickly' in content:
+            facts['timeline'] = 'urgent'
+        elif 'months' in content:
+            months_match = re.search(r'(\d+)\s*months?', content)
+            if months_match:
+                facts['timeline'] = f"{months_match.group(1)} months"
+
+        # Track sector
+        sectors = ['materials', 'biomedical', 'medtech', 'ai', 'software', 'healthtech', 'diagnostics']
+        for sector in sectors:
+            if sector in content:
+                facts['sector'] = sector
+                break
+
+        # Track stage
+        if 'pre-seed' in content or 'preseed' in content:
+            facts['stage'] = 'pre-seed'
+        elif 'seed' in content:
+            facts['stage'] = 'seed'
+        elif 'series a' in content:
+            facts['stage'] = 'series-a'
+
+    return facts
+
+
+def get_smart_followup(query: str, grants: list, conversation_history: list, known_facts: dict = None) -> Optional[str]:
+    """
+    Generate intelligent follow-up questions based on what's missing from the conversation.
+    NEVER asks about facts we already know. Adds variety to avoid repetitive questions.
+
+    Args:
+        query: Current user query
+        grants: List of matched grants
+        conversation_history: Recent conversation messages
+        known_facts: Dictionary of already-known facts
+
+    Returns:
+        Smart follow-up question or None
+    """
+    import random
+
+    if known_facts is None:
+        known_facts = extract_conversation_facts(conversation_history)
+
+    query_lower = query.lower()
+
+    # Check what's missing (only ask about unknowns)
+    unknowns = {
+        'trl': known_facts.get('trl') is None,
+        'clinical': known_facts.get('clinical_champion') is None,
+        'timeline': known_facts.get('timeline') is None,
+        'budget': known_facts.get('budget') is None,
+        'sector': known_facts.get('sector') is None,
+        'partnerships': not known_facts.get('partnerships'),
+        'revenue': 'revenue' not in str(conversation_history).lower(),
+    }
+
+    # Grant-specific strategic questions
+    if grants and len(grants) > 0:
+        top_grant = grants[0]
+        grant_title_lower = top_grant.get('title', '').lower()
+
+        # i4i specific questions
+        if 'i4i' in grant_title_lower and unknowns['clinical']:
+            clinical_questions = [
+                "Who's your clinical champion? NIHR will definitely ask.",
+                "Got an NHS trust on board? That's critical for i4i.",
+                "Do you have clinical validation lined up? i4i panel obsesses over that.",
+            ]
+            return random.choice(clinical_questions)
+
+        # Biomedical Catalyst questions
+        if 'biomedical catalyst' in grant_title_lower:
+            if unknowns['revenue']:
+                return "Any revenue yet? Biomedical Catalyst loves to see commercial traction."
+            elif unknowns['partnerships']:
+                return "Got any industry partners lined up? Helps with Biomedical Catalyst."
+
+        # KTP questions
+        if 'ktp' in grant_title_lower or 'knowledge transfer' in grant_title_lower:
+            if unknowns['partnerships']:
+                return "Which university are you thinking of partnering with for KTP?"
+            else:
+                return "What specific R&D capability are you looking to access through KTP?"
+
+        # Innovation Loans questions
+        if 'loan' in grant_title_lower:
+            if unknowns['revenue']:
+                return "What's your current revenue? Loans need proof you can repay."
+            else:
+                return "Can you demonstrate cashflow for loan repayment? Credit team will scrutinize that."
+
+    # General strategic questions (varied)
+    if unknowns['trl'] and unknowns['sector']:
+        sector_questions = [
+            "What sector are you in - medtech, materials, AI?",
+            "Quick one - what space are you operating in?",
+            "Tell me your sector and rough TRL?",
+        ]
+        return random.choice(sector_questions)
+
+    if unknowns['trl']:
+        trl_questions = [
+            "What TRL are you at roughly?",
+            "Where are you development-wise - prototype, pilot, or commercial?",
+            "What's your tech readiness level looking like?",
+        ]
+        return random.choice(trl_questions)
+
+    if unknowns['timeline']:
+        timeline_questions = [
+            "When do you need the funding by?",
+            "What's your timeline looking like?",
+            "How urgent is this - months or weeks?",
+        ]
+        return random.choice(timeline_questions)
+
+    if grants and unknowns['budget']:
+        first_grant = grants[0]
+        funding = first_grant.get('total_fund_gbp') or first_grant.get('total_fund')
+        if funding:
+            budget_questions = [
+                f"Is {funding} the right scale for you?",
+                f"Does {funding} match what you need?",
+                f"Thinking {funding} range or bigger?",
+            ]
+            return random.choice(budget_questions)
+
+    # Partnership/commercial questions for depth
+    if unknowns['partnerships'] and len(conversation_history) > 3:
+        return "Any industry or academic partners on board?"
+
+    return None
 
 
 def expand_query_for_search(query: str) -> str:
@@ -1597,6 +2167,16 @@ async def chat_with_grants_stream(req: ChatRequest):
 
     logger.info(f"/chat/stream query: {query!r}")
 
+    # Validate TRL if mentioned - catch invalid values early
+    trl_validation = validate_and_correct_trl(query)
+    if not trl_validation['valid'] and trl_validation['correction']:
+        # User provided invalid TRL - correct them immediately
+        logger.warning(f"Invalid TRL detected in query: {query}")
+        async def trl_correction_generator():
+            yield f"data: {json.dumps({'type': 'token', 'content': trl_validation['correction']})}\n\n"
+            yield f"data: {json.dumps({'type': 'done'})}\n\n"
+        return StreamingResponse(trl_correction_generator(), media_type="text/event-stream")
+
     # Initialize LLM client if needed
     if chat_llm_client is None:
         try:
@@ -1624,22 +2204,36 @@ async def chat_with_grants_stream(req: ChatRequest):
                     company_info = parse_company_website(url)
 
                     if company_info:
-                        keywords_str = ', '.join(company_info['keywords']) if company_info['keywords'] else 'AI/tech company'
+                        # Build rich, actionable context
+                        keywords_str = ', '.join(company_info['keywords'][:5]) if company_info['keywords'] else 'tech company'
+                        grants_str = ', '.join(company_info.get('suggested_grants', [])) if company_info.get('suggested_grants') else 'Not determined'
+
                         website_context = f"""
 
-🌐 COMPANY CONTEXT (from {url}):
-- Company: {company_info['title']}
-- Focus: {keywords_str}
-- Stage: {company_info['stage']}
+🌐 ANALYZED {url}:
+Company: {company_info['title']}
+Sector: {company_info.get('sector', 'general')}
+Estimated TRL: {company_info.get('trl_estimate', 'unknown')}
+Stage: {company_info['stage']}
+Tech focus: {keywords_str}
+Likely grant fits: {grants_str}
 
-Use this context to personalize grant recommendations specifically for this company."""
+IMPORTANT: Use this intel to give SPECIFIC advice tailored to THIS company. Reference their actual sector and stage.
+Example: "Just checked out {company_info['title']} - {company_info.get('sector', 'your')} platform, right? For {company_info.get('sector', 'your sector')} at TRL {company_info.get('trl_estimate', 'your stage')}, here's what makes sense..."
+"""
 
-                        # Enhance query with website context
-                        if company_info['keywords']:
-                            enhanced_query = f"{query} {' '.join(company_info['keywords'])}"
-                            logger.info(f"✓ Enhanced query with website keywords: {company_info['keywords']}")
+                        # Enhance query with sector and keywords for better search
+                        search_terms = []
+                        if company_info.get('sector') and company_info['sector'] != 'general':
+                            search_terms.append(company_info['sector'])
+                        if company_info.get('keywords'):
+                            search_terms.extend(company_info['keywords'][:3])
+
+                        if search_terms:
+                            enhanced_query = f"{query} {' '.join(search_terms)}"
+                            logger.info(f"✓ Enhanced query: {enhanced_query[:100]}...")
                         else:
-                            logger.warning(f"⚠️ No keywords extracted from {url}")
+                            logger.warning(f"⚠️ No search terms extracted from {url}")
                     else:
                         logger.warning(f"⚠️ parse_company_website returned None for {url}")
                         website_context = f"\n🌐 Note: User provided website {url} but couldn't parse it automatically.\n"
@@ -1939,7 +2533,29 @@ Use this context to personalize grant recommendations specifically for this comp
             # Step 7: Build context
             context = build_llm_context(query, hits, grants)
 
-            # Step 6: Create streaming-specific prompt (outputs MARKDOWN, not JSON!)
+            # Step 7a: Extract known facts from conversation to avoid asking twice
+            known_facts = extract_conversation_facts(req.history or [])
+            logger.info(f"Known facts: {known_facts}")
+
+            # Step 7b: Analyze query intent for better context
+            query_intent = analyze_query_intent(query)
+            logger.info(f"Query intent: {query_intent}")
+
+            # Step 7c: Generate smart follow-up if appropriate (uses known_facts)
+            smart_followup = get_smart_followup(query, grants, req.history or [], known_facts)
+            if smart_followup:
+                logger.info(f"Generated smart follow-up: {smart_followup}")
+
+            # Step 6: Load expert examples dynamically
+            try:
+                expert_examples = get_expert_examples(limit=3, min_quality=4)
+                expert_examples_text = format_expert_examples_for_prompt(expert_examples)
+                logger.info(f"Loaded {len(expert_examples)} expert examples for prompt")
+            except Exception as e:
+                logger.warning(f"Failed to load expert examples: {e}")
+                expert_examples_text = ""
+
+            # Step 7: Create streaming-specific prompt (outputs MARKDOWN, not JSON!)
             grants_list = "\n".join([f"- {g['title']} ({g['source']})" for g in grants[:5]])
 
             # Build conversation context for the system prompt
@@ -1981,11 +2597,101 @@ Use this context to personalize grant recommendations specifically for this comp
                     conversation_context += f"DO NOT switch to other grants. Answer ONLY about {grant_name}.\n"
                     conversation_context += f"The search results below are filtered for {grant_name}.\n"
 
-            STREAMING_SYSTEM_PROMPT = f"""You are Ailsa, a friendly UK research funding advisor who knows NIHR and Innovate UK grants inside out.
+            EXPERT_SYSTEM_PROMPT = f"""You are an experienced UK grant consultant. Talk naturally but stay focused.
+
+VOICE RULES:
+- Be conversational but concise - aim for 2-3 solid paragraphs max
+- Skip the war stories unless genuinely relevant
+- If you know something (TRL, budget, sector), NEVER ask again - reference it instead
+- Lead with the answer, then ask ONE strategic follow-up question
+- No rambling, no repetition, no unnecessary context
+
+RESPONSE STRUCTURE:
+1. Direct answer to their question (1-2 sentences)
+2. Key insight or warning (1-2 sentences)
+3. ONE strategic question to move forward
+
+GOOD EXAMPLES:
+
+"TRL 4 puts you in the sweet spot for i4i actually. You'll need clinical validation though - got a clinical lead?"
+
+"Since you're at TRL 4 in materials, the ATI Programme is your best bet - £1.5M available. What's the application - aerospace or automotive?"
+
+BAD EXAMPLES (Never do this):
+
+"Oh that's interesting! TRL 4, I see. Well, I remember working with another company at TRL 4 and they had quite a journey..."
+
+"There are 3 relevant grants: 1. NIHR i4i Product Development Award... 2. Biomedical Catalyst... 3. Smart Grants..."
+
+CONVERSATION MEMORY - CRITICAL:
+When facts are established, reference them, don't re-ask:
+✅ "Since you're at TRL 4..."
+❌ "What's your TRL?"
+
+✅ "Given your £500k budget..."
+❌ "How much funding do you need?"
+
+ALREADY KNOWN FACTS - DO NOT ASK ABOUT THESE AGAIN:
+{format_known_facts(known_facts)}
+
+GRANT-SPECIFIC INSIDER KNOWLEDGE (weave in naturally when relevant):
+
+NIHR i4i:
+- Obsessed with clinical pull vs technology push - reviewers hate "cool tech looking for a problem"
+- MUST have NHS/clinical champion on board - non-negotiable
+- Patient benefit needs to be crystal clear in first paragraph
+- Information Governance critical for any data-related projects
+- Success rate ~15-20%, very competitive
+- Takes 6-9 months from application to decision
+
+Biomedical Catalyst:
+- Early stage = feasibility studies (smaller £)
+- Late stage = development to market (larger £)
+- Commercial route must be clearly mapped out
+- Match funding helps but not required
+- Combines Innovate UK commercial focus + NIHR clinical rigor
+
+Innovation Loans:
+- Repayable: 3.7% during project, 7.4% during repayment
+- Credit team scrutinizes financials HARD - need proof of repayment capacity
+- Good for later-stage companies with revenue
+- More flexible than grants but riskier financially
+- Don't apply if you can't demonstrate cashflow
+
+Knowledge Transfer Partnership (KTP):
+- 2-3 year projects partnering with universities
+- You get skilled graduate + academic expertise
+- Government covers ~2/3 of costs
+- Perfect for accessing university facilities/knowledge you don't have
+- Great way to de-risk R&D
+
+Smart Grants:
+- PAUSED as of January 2025, not accepting applications
+- If asked: "Smart Grants are on hold. Try Biomedical Catalyst or sector-specific competitions instead."
+
+CONVERSATIONAL EXAMPLES (how to actually sound):
+
+Query: "What grants for medical devices?"
+✅ Good: "For medtech, i4i is your main play - but they want clinical evidence, not just a cool device. Got an NHS trust interested?"
+❌ Bad: "Medical device grants include: NIHR i4i Product Development Award, Biomedical Catalyst, Innovation Loans..."
+
+Query: "How much can I get?"
+✅ Good: "i4i typically goes up to £1M, sometimes £2M for really strong projects. What's your budget looking like?"
+❌ Bad: "Funding amounts vary by grant type. Please see the grant cards below for specific amounts."
+
+Query: "Should I apply for a loan or grant?"
+✅ Good: "Grants are free money but 10-20% success rates. Loans give you more control at 3.7% rates, but the Credit team will grill your financials. What's your runway?"
+❌ Bad: "Both options have merits. Grants provide non-repayable funding while loans offer flexibility with structured repayment."
+
+Query: "When's the deadline?"
+✅ Good: "i4i closes December 3rd - that's 22 days from now. Doable if you start this week, but it'll be tight."
+❌ Bad: "The deadline for the NIHR i4i Product Development Award Round 29 is December 3rd, 2024."
 
 CRITICAL: Output PLAIN MARKDOWN only (NOT JSON!). This will be displayed directly to users as it streams.
 {conversation_context}
 {website_context}
+
+{expert_examples_text}
 
 ---EXPERT RESPONSE STYLE---
 
@@ -2069,146 +2775,116 @@ Remember: You're a strategic advisor with insider knowledge, not just an informa
 
 ---END EXPERT STYLE GUIDE---
 
-CONVERSATIONAL CONTINUITY & REFERENCES:
-- Pay attention to what you JUST discussed with the user in the conversation above
-- Users will reference your previous responses using "number 2", "the first one", "that grant", etc.
-- When you list grants numbered (1., 2., 3.), remember them for follow-up questions
-
 CONVERSATIONAL MEMORY:
-- Track what grant you JUST discussed in detail (e.g., "Postdoctoral Award (Cohort 2)")
-- When users say "this opportunity", "it", "that grant", "the award", they mean the grant you just explained
-- Don't search broadly when the context is clear - stay focused on the grant being discussed
-- If user asks "what are the application questions for this opportunity?" after discussing Grant X, they mean Grant X
+- Remember what you JUST discussed - users expect continuity
+- If you just talked about i4i and they say "What's the deadline?", they mean i4i
+- If you mentioned 3 grants and they say "Tell me about the second one", you know what they mean
+- Don't make them repeat themselves - that's annoying in real conversations
 
-CRITICAL - REQUEST FOR MORE OPTIONS:
-- When user says "anything else?", "what else?", "show me more", "other options" → They want DIFFERENT grants, not the same one again
-- Go back to their ORIGINAL query topic and show additional grants (up to 5)
-- DO NOT repeat grants you already discussed
-- If you've already shown the best matches, be honest: "Those are the top matches. The next options are less relevant, but..."
+HANDLING FOLLOW-UPS NATURALLY:
+- If you just talked about Biomedical Catalyst and they ask "What's the deadline?", they mean Biomedical Catalyst
+- If they say "Tell me about the second one", you know they mean #2 from your list
+- When they ask "How do I apply?", assume they mean the grant you JUST discussed
+- Don't hedge or apologize - just answer: "For Biomedical Catalyst, the deadline is..." not "I'm not sure which grant you mean..."
 
-EXAMPLES:
-✅ CORRECT:
-User: "show me ai grants" → Show Agentic AI Prize
-User: "anything else?" → Show 4 OTHER AI-related grants (exclude Agentic AI Prize)
+WHEN THEY WANT MORE:
+- "Anything else?" = Show different grants on the same topic
+- "What about the other one?" = Switch focus to a different grant from your list
+- Be honest if you've shown the best: "Honestly, those are your top matches. The rest are pretty marginal for what you need."
 
-❌ WRONG:
-User: "show me ai grants" → Show Agentic AI Prize
-User: "anything else?" → Show Agentic AI Prize AGAIN
+SMART GRANTS ARE PAUSED:
+- Don't recommend Smart Grants - they're paused as of January 2025
+- If someone asks about them: "Smart Grants are on hold right now. For similar funding, look at Biomedical Catalyst or sector-specific competitions instead."
 
-CRITICAL - CONTEXT LOCKING:
-- Multiple follow-ups in a row all refer to the SAME grant until the user explicitly changes topics
-- When you see 🔒 CONTEXT LOCKED in the conversation above, DO NOT switch to a different grant
-- If locked onto Grant X, ONLY discuss Grant X - ignore other grants in the search results
-- DO NOT say "I found these grants..." when locked - you're answering about ONE specific grant
+HOW TO ACTUALLY TALK:
+Instead of: "There are 3 relevant grants: 1. NIHR i4i Product Development..."
+Say: "For a medtech at your stage, I'd start with i4i - it's NIHR's main product development stream. Have you got clinical evidence yet? That's the big one they care about."
 
-TYPO HANDLING:
-- "thus" usually means "this" (common typo)
-- "application questions for thus" = "application questions for this grant we're discussing"
+Instead of: "## Eligibility Requirements\n- UK registered company\n- TRL 4-6"
+Say: "Quick check - you're UK-based and somewhere around TRL 4-6, right? Because if you're earlier than that, i4i probably isn't the move."
 
-Example conversation flow:
-User: "postdoc funding" → List several grants
-User: "tell me more about the first one" → 🔒 LOCK: Discuss Postdoctoral Award
-User: "what are the application questions?" → 🔒 STILL LOCKED: Application questions for Postdoctoral Award
-User: "what about eligibility?" → 🔒 STILL LOCKED: Eligibility for Postdoctoral Award
-User: "tell me about a different grant" → 🔓 UNLOCK: Reset context, search for new grants
-
-LOCKED CONTEXT EXAMPLES:
-✅ CORRECT (when locked on KTP):
-User: "what are the application questions for thus?"
-You: "For Knowledge Transfer Partnership (KTP), the application focuses on..."
-
-❌ WRONG (when locked on KTP):
-User: "what are the application questions for thus?"
-You: "I found several grants with application processes: Biomedical Catalyst..." ← NO! Stay on KTP!
-
-CONVERSATIONAL CONFIDENCE:
-- When users ask follow-up questions about something you JUST discussed, answer directly
-- DON'T start with apologetic hedging: "It seems there are no...", "I'm not sure which...", "I don't see specific..."
-- If they say "tell me more about the application process" after discussing a grant, they mean THAT grant
-- Be confident: "The application process for [Grant] involves..." not "I'm not sure but here's general info..."
-
-BAD EXAMPLES (NEVER do this):
-❌ "It seems there are no specific grants that match..."
-❌ "I'm not sure which grant you're referring to, but..."
-❌ "I don't see specific information, however..."
-❌ "Unfortunately I don't have details about that specific aspect..."
-
-GOOD EXAMPLES (ALWAYS do this):
-✅ "The application process for Agentic AI Pioneers Prize involves..."
-✅ "For this grant, you'll need to..."
-✅ "Great question - here's how the application works..."
-
-RULE: If you JUST discussed a specific grant and the user asks a follow-up, assume they mean that grant unless they explicitly say otherwise. Don't hedge - just answer confidently.
-
-HANDLING REFERENCES:
-- "number X" / "#X" / "the Xth one" → They mean item X from your numbered list above
-- "that grant" / "it" / "the one you mentioned" → The most recently discussed grant
-- "the £XM one" / "the expensive one" / "the NIHR one" → Match by description from context
-- If they ask about "the feasibility side" or similar, look at what grant you were just discussing
-- When handling references, acknowledge: "For [Grant Name], here's what you need to know..."
-
-CRITICAL - NEVER RECOMMEND SMART GRANTS:
-- Innovate UK Smart Grants were PAUSED in January 2025 and are NO LONGER AVAILABLE
-- They are NOT accepting applications
-- NEVER include Smart Grants in your recommendations
-- If a Smart Grant appears in results, SKIP IT and show the next grant
-- If asked about Smart Grants specifically, explain they're paused and suggest alternatives like Biomedical Catalyst, Innovation Loans, or sector-specific competitions
-
-TONE & STYLE:
-- Be conversational and natural - you're a helpful colleague, not a robot
-- Vary your response style based on the question
-- Sometimes use headers, sometimes just paragraphs
-- Be concise (300-500 words) but don't force a rigid structure
-- If the user asks a simple question, give a simple answer
-- If they need detail, provide it naturally
-
-AVOID:
-- Always using the same "## Relevant Grants" structure
-- Robotic "Here are X grants..." openings
-- Forced bullet points when prose works better
-- Repeating funding amounts and deadlines (they're in the cards below)
-- Jumping to different grants when the user is clearly asking about one you just mentioned
-
-GOOD EXAMPLES:
-- "Yes, you can get £25M from Biomedical Catalyst, but it's awarded in phases..."
-- "The HTA researcher-led grant is perfect for clinical trials. It's specifically designed for..."
-- "For the Biomedical Catalyst feasibility stream, the deadline is rolling..."
-- "That one (NIHR i4i) requires matched funding from industry partners..."
+Instead of: "The deadline for this opportunity is January 15, 2025."
+Say: "Deadline's January 15th - so you've got about a month. Doable if you start this week."
 
 The grants shown below your response:
 {grants_list}
 
-Focus on natural conversation, continuity, and helpful insights - not just listing facts."""
+Remember: You're chatting with a founder over coffee, not writing a grant database entry. Be helpful, direct, and real."""
+
+            # Build enhanced user prompt with intent and follow-up guidance
+            user_content = f"USER QUERY: {query}\n"
+            user_content += f"Query Intent: {query_intent}\n\n"
+
+            # Add conversation context if available
+            if req.history and len(req.history) > 0:
+                recent_exchanges = "\n".join([
+                    f"{'User' if msg.role == 'user' else 'You'}: {msg.content[:150]}..."
+                    for msg in req.history[-3:]  # Last 3 messages
+                    if len(msg.content) > 50  # Skip short/welcome messages
+                ])
+                if recent_exchanges:
+                    user_content += f"RECENT CONVERSATION:\n{recent_exchanges}\n\n"
+
+            user_content += f"RELEVANT GRANT CONTEXT:\n{context}\n\n"
+
+            # Add smart follow-up guidance if we generated one
+            if smart_followup:
+                user_content += f"💡 Consider ending with this follow-up: {smart_followup}\n\n"
+
+            user_content += "Respond naturally like you're their experienced advisor. Be conversational, direct, and helpful."
 
             messages = [
-                {"role": "system", "content": STREAMING_SYSTEM_PROMPT},
-                {
-                    "role": "user",
-                    "content": (
-                        f"USER QUERY: {query}\n\n"
-                        f"RELEVANT GRANT CONTEXT:\n{context}\n\n"
-                        f"Provide helpful, concise advice in plain markdown."
-                    ),
-                },
+                {"role": "system", "content": EXPERT_SYSTEM_PROMPT},
+                {"role": "user", "content": user_content},
             ]
+
+            # Adjust temperature based on conversation dynamics
+            conversation_length = len(req.history) if req.history else 0
+            dynamic_temp = adjust_temperature_for_conversation(conversation_length, len(query))
+            logger.info(f"Dynamic temperature: {dynamic_temp} (conv_len={conversation_length}, query_len={len(query)})")
+
+            # Initialize grant mention detector
+            grant_detector = GrantMentionDetector(grant_store)
+            full_response = ""
 
             # Stream the response tokens as they arrive from LLM
             for chunk in chat_llm_client.chat_stream(
                 messages=messages,
-                temperature=0.3,  # Lower = more focused/concise
-                max_tokens=800,   # Reduced from 2000 for brevity
+                temperature=dynamic_temp,  # Dynamically adjusted based on conversation context
+                max_tokens=400,   # Shorter, punchier responses (2-3 paragraphs)
             ):
+                full_response += chunk
                 # Stream each token immediately to the client
                 yield f"data: {json.dumps({'type': 'token', 'content': chunk})}\n\n"
 
-            # Prepare grant cards with enriched metadata
+            # Auto-detect grant mentions in the response
+            mentioned_grants = grant_detector.extract_grant_mentions(full_response, grants)
+            logger.info(f"Detected {len(mentioned_grants)} grant mentions in response")
+
+            # Prepare grant cards - prioritize mentioned grants, then show search results
             grant_refs = []
+            seen_ids = set()
+
+            # First add mentioned grants (high priority)
+            for g in mentioned_grants:
+                if g.get('grant_id') not in seen_ids:
+                    seen_ids.add(g['grant_id'])
+                    grant_refs.append(g)
+
+            # Then add remaining search result grants (if not already included)
             for g in grants[:5]:
+                if g.get('grant_id') not in seen_ids:
+                    seen_ids.add(g['grant_id'])
+                    grant_refs.append(g)
+
+            # Enrich grant cards with full metadata
+            enriched_grant_refs = []
+            for g in grant_refs[:5]:  # Limit to top 5
                 # Get full grant details for enrichment
                 try:
                     full_grant = grant_store.get_grant(g["grant_id"])
                     if full_grant:
-                        grant_refs.append({
+                        enriched_grant_refs.append({
                             "grant_id": g["grant_id"],
                             "title": g["title"],
                             "url": g["url"],
@@ -2216,11 +2892,11 @@ Focus on natural conversation, continuity, and helpful insights - not just listi
                             "is_active": full_grant.is_active,
                             "total_fund_gbp": full_grant.total_fund_gbp if hasattr(full_grant, 'total_fund_gbp') else None,
                             "closes_at": full_grant.closes_at.isoformat() if full_grant.closes_at else None,
-                            "score": g.get("best_score", 0.0)
+                            "score": g.get("best_score", 0.95)  # High score for mentioned grants
                         })
                     else:
                         # Fallback without enrichment
-                        grant_refs.append({
+                        enriched_grant_refs.append({
                             "grant_id": g["grant_id"],
                             "title": g["title"],
                             "url": g["url"],
@@ -2228,24 +2904,24 @@ Focus on natural conversation, continuity, and helpful insights - not just listi
                             "is_active": True,
                             "total_fund_gbp": g.get("total_fund_gbp"),
                             "closes_at": g.get("closes_at"),
-                            "score": g.get("best_score", 0.0)
+                            "score": g.get("best_score", 0.95)
                         })
                 except Exception as e:
                     logger.warning(f"Failed to enrich grant {g['grant_id']}: {e}")
                     # Use basic info
-                    grant_refs.append({
+                    enriched_grant_refs.append({
                         "grant_id": g["grant_id"],
-                        "title": g["title"],
-                        "url": g["url"],
-                        "source": g["source"],
+                        "title": g.get("title", "Unknown Grant"),
+                        "url": g.get("url", "#"),
+                        "source": g.get("source", "unknown"),
                         "is_active": True,
                         "total_fund_gbp": None,
                         "closes_at": None,
-                        "score": g.get("best_score", 0.0)
+                        "score": g.get("best_score", 0.95)
                     })
 
-            # Send grants
-            yield f"data: {json.dumps({'type': 'grants', 'grants': grant_refs})}\n\n"
+            # Send grants (mentioned grants prioritized)
+            yield f"data: {json.dumps({'type': 'grants', 'grants': enriched_grant_refs})}\n\n"
 
             # Done
             yield f"data: {json.dumps({'type': 'done'})}\n\n"
