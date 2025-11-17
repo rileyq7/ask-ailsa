@@ -17,6 +17,9 @@ import sqlite3
 from pathlib import Path
 from typing import List, Optional
 
+import requests
+from bs4 import BeautifulSoup
+
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -156,30 +159,50 @@ def _grant_to_summary(grant: Grant) -> GrantSummary:
 # Scoring thresholds for grant filtering
 MIN_SCORE_STRONG = 0.55
 MIN_SCORE_WEAK = 0.48
-MAX_GRANTS = 5  # Show up to 5 relevant grants
+MAX_GRANTS = 3  # Show up to 3 relevant grants (quality over quantity)
 
 # System prompt for neutral search assistant
 SYSTEM_PROMPT = """You are Ailsa, a UK research funding advisor specializing in NIHR and Innovate UK grants.
 
-RESPONSE STYLE:
+RESPONSE QUANTITY & LENGTH:
+- Show 2-3 grants max in your initial response, not all available options
+- Pick the MOST relevant grants based on the user's query
+- Users can always ask "what else?" or "show me more" if they want additional options
+- Quality over quantity - better to explain 2-3 grants well than 5+ poorly
 - **BE CONCISE**: Aim for 300-500 words maximum
-- Start with a 1-2 sentence summary
-- Focus on the 2-3 most relevant grants only
-- Use bullet points for key details
 - Cut filler words and repetition
 
-YOUR JOB:
-1. **Quick Summary** (1-2 sentences): Answer the main question directly
-2. **Top Grants** (2-3 grants max):
-   - Grant name and why it fits
-   - 2-3 key bullets per grant (focusing on eligibility, application tips, strategic insights)
-3. **Next Steps** (2-3 actions): Specific things to do next
+RESPONSE STYLE FLEXIBILITY:
+- The examples show TONE and PATTERNS, not a rigid template
+- DON'T force every response into "Ailsa's Take / Why it's a fit / Next steps" structure
+- Adapt your format based on the question:
+  * Simple query → Simple answer (2-3 paragraphs)
+  * Complex query → Structured breakdown
+  * Follow-up → Direct answer without repeating structure
+- Use natural conversation flow
+
+WHEN TO USE STRUCTURED FORMAT:
+✅ User asks: "Show me grants for X" → Use structure for 2-3 grants
+✅ User asks: "What's the best grant for Y?" → Use structure for top pick
+❌ User asks: "What's the deadline?" → Just answer directly, no structure
+❌ User asks: "How do I apply?" → Explain process, no "Ailsa's Take" needed
+
+EXAMPLE FLEXIBLE RESPONSES:
+
+Query: "What's the deadline for Biomedical Catalyst?"
+Response: "The current Biomedical Catalyst round closes December 10, 2025 - that's 22 days from now. Given the competitive nature and detailed application requirements, I'd recommend starting your proposal this week if you're serious about applying."
+
+Query: "Should I apply for loans or grants?"
+Response: "Depends on your financial position and timeline. Grants are non-repayable but highly competitive (10-20% success rates). Innovation Loans give you more flexibility with 3.7% rates during the project, but Innovate UK's Credit team will scrutinize your ability to repay. What's your current runway and revenue situation?"
+
+Query: "Show me medical device grants"
+Response: [Use full structured format for 2-3 top grants]
 
 FORMATTING RULES:
-- Use ## for grant section headers
+- Use ## for grant section headers (when appropriate)
 - Use **bold** for emphasis
 - Keep paragraphs to 2-3 sentences
-- Use bullet lists for details
+- Use bullet lists for details when helpful
 - NO repetition of funding/deadline info (shown in grant cards below)
 
 CRITICAL:
@@ -188,30 +211,11 @@ CRITICAL:
 - Focus on eligibility, application tips, and strategic advice
 - If grants aren't perfect matches, say so clearly
 
-EXAMPLE RESPONSE STRUCTURE:
-```
-You have 3 open grants for [topic], with deadlines from [date] to [date]. The strongest match is [grant name].
-
-## [Grant Name 1]
-Brief description of what it funds.
-
-**Why it fits:** One sentence on relevance.
-**Key insight:** One actionable tip about the application.
-
-## [Grant Name 2]
-...
-
-**Next steps:**
-1. Check [specific eligibility requirement] for [grant]
-2. Download application guidance from [grant] page
-3. Prioritize [earliest deadline grant] - due in [X] days
-```
-
 TONE & STYLE:
 - Professional but warm
 - Direct and actionable
 - Use "you" to speak to the user
-- Cut verbose phrases
+- Vary your style based on the question type
 
 HANDLING EDGE CASES:
 - If NO grants match but question is about general funding: Provide brief helpful guidance
@@ -313,7 +317,7 @@ def select_top_grants(hits, query: str = ""):
         query: User query for semantic boosting
 
     Returns:
-        List of top grant summaries (up to MAX_GRANTS)
+        List of top grant summaries (up to MAX_GRANTS, or more if user requests)
     """
     from collections import defaultdict
 
@@ -331,6 +335,12 @@ def select_top_grants(hits, query: str = ""):
         # Get grant details
         grant = grant_store.get_grant(gid)
         if not grant:
+            continue
+
+        # Filter out Smart Grants (paused January 2025)
+        title_lower = grant.title.lower()
+        if "smart grant" in title_lower or "smart grants" in title_lower:
+            logger.info(f"Filtered out Smart Grant: {grant.title}")
             continue
 
         # Apply semantic boosting
@@ -376,14 +386,21 @@ def select_top_grants(hits, query: str = ""):
     open_grants.sort(key=lambda x: x["best_score"], reverse=True)
     closed_grants.sort(key=lambda x: x["best_score"], reverse=True)
 
+    # Check if user wants comprehensive list
+    query_lower = query.lower()
+    max_grants = MAX_GRANTS
+    if any(phrase in query_lower for phrase in ['all grants', 'show me everything', 'complete list', 'all options', 'show more', 'what else']):
+        max_grants = 5
+        logger.info(f"User requested comprehensive list, showing up to {max_grants} grants")
+
     # Prioritize open grants but include 1-2 closed if we have few open grants
-    relevant = open_grants[:MAX_GRANTS]
+    relevant = open_grants[:max_grants]
 
     # Only add closed grants if we have fewer than 3 open grants
     if len(relevant) < 3 and closed_grants:
         # Add up to 2 closed grants to provide context
         relevant.extend(closed_grants[:2])
-        relevant = relevant[:MAX_GRANTS]  # Ensure we don't exceed max
+        relevant = relevant[:max_grants]  # Ensure we don't exceed max
 
     logger.info(f"Selected {len(open_grants)} open and {len(closed_grants)} closed grants, returning {len(relevant)} total")
 
@@ -746,6 +763,194 @@ def _truncate(text: str, max_chars: int = 900) -> str:
     if len(text) <= max_chars:
         return text
     return text[: max_chars - 3] + "..."
+
+
+# -----------------------------------------------------------------------------
+# Website Parsing Functions
+# -----------------------------------------------------------------------------
+
+def extract_url_from_message(message: str) -> Optional[str]:
+    """
+    Extract URL from user message.
+
+    Args:
+        message: User message text
+
+    Returns:
+        Extracted URL or None if not found
+    """
+    url_pattern = r'https?://[^\s<>"{}|\\^`\[\]]+'
+    match = re.search(url_pattern, message)
+    return match.group(0) if match else None
+
+
+def parse_company_website(url: str) -> Optional[dict]:
+    """
+    Parse company website to extract context for grant matching.
+
+    Args:
+        url: Company website URL
+
+    Returns:
+        Dict with extracted context or None if parsing fails
+    """
+    try:
+        response = requests.get(
+            url,
+            timeout=10,
+            headers={'User-Agent': 'Mozilla/5.0 (compatible; AilsaBot/1.0)'},
+            allow_redirects=True
+        )
+        response.raise_for_status()
+
+        soup = BeautifulSoup(response.text, 'html.parser')
+
+        # Extract meta description
+        meta_desc = soup.find('meta', attrs={'name': 'description'})
+        description = meta_desc.get('content', '') if meta_desc else ''
+
+        # Extract title
+        title = soup.find('title')
+        title_text = title.text.strip() if title else ''
+
+        # Extract main body text (first 1000 chars)
+        # Remove script and style elements
+        for script in soup(["script", "style"]):
+            script.decompose()
+
+        body_text = soup.get_text(separator=' ', strip=True)
+        body_text = ' '.join(body_text.split())[:1000]
+
+        # Combine for context
+        full_text = f"{title_text} {description} {body_text}"
+
+        # Extract keywords
+        keywords = extract_keywords(full_text)
+
+        # Try to detect company stage
+        stage = detect_company_stage(full_text)
+
+        logger.info(f"✓ Parsed website: {url} - Found {len(keywords)} keywords, stage: {stage}")
+
+        return {
+            'url': url,
+            'title': title_text,
+            'description': description,
+            'keywords': keywords,
+            'stage': stage,
+            'full_context': full_text[:500]
+        }
+
+    except requests.RequestException as e:
+        logger.warning(f"Failed to fetch website {url}: {e}")
+        return None
+    except Exception as e:
+        logger.error(f"Failed to parse website {url}: {e}")
+        return None
+
+
+def extract_keywords(text: str) -> list:
+    """
+    Extract relevant technology and industry keywords from text.
+
+    Args:
+        text: Text to extract keywords from
+
+    Returns:
+        List of found keywords
+    """
+    # Technology and industry keywords relevant for UK grants
+    tech_keywords = [
+        'AI', 'artificial intelligence', 'machine learning', 'deep learning',
+        'healthcare', 'medical device', 'biotech', 'biotechnology',
+        'pharma', 'pharmaceutical', 'digital health', 'healthtech',
+        'clinical', 'diagnostics', 'therapeutics', 'drug discovery',
+        'SaaS', 'platform', 'software', 'data science',
+        'regenerative medicine', 'gene therapy', 'immunotherapy',
+        'precision medicine', 'personalized medicine',
+        'medical imaging', 'wearable', 'IoT', 'sensors',
+        'robotics', 'automation', 'manufacturing',
+        'clean tech', 'renewable energy', 'sustainability',
+        'fintech', 'edtech', 'agritech'
+    ]
+
+    text_lower = text.lower()
+    found = [kw for kw in tech_keywords if kw.lower() in text_lower]
+
+    return list(set(found))[:10]  # Return up to 10 unique keywords
+
+
+def detect_company_stage(text: str) -> str:
+    """
+    Detect company stage from website text.
+
+    Args:
+        text: Website text
+
+    Returns:
+        Detected stage: 'early-stage', 'growth-stage', 'established', or 'unknown'
+    """
+    text_lower = text.lower()
+
+    # Early-stage indicators
+    early_indicators = ['seed', 'pre-seed', 'startup', 'launching', 'founded in 202']
+    if any(term in text_lower for term in early_indicators):
+        return 'early-stage'
+
+    # Growth-stage indicators
+    growth_indicators = ['series a', 'series b', 'series c', 'scale', 'scaling', 'growth']
+    if any(term in text_lower for term in growth_indicators):
+        return 'growth-stage'
+
+    # Established indicators
+    established_indicators = ['established', 'leading', 'years of experience', 'decades', 'industry leader']
+    if any(term in text_lower for term in established_indicators):
+        return 'established'
+
+    return 'unknown'
+
+
+def expand_query_for_search(query: str) -> str:
+    """
+    Expand broad queries with related terms to improve search recall.
+
+    Args:
+        query: Original search query
+
+    Returns:
+        Expanded query with related terms
+    """
+    query_lower = query.lower()
+
+    # Comprehensive expansion mappings for better vector search
+    expansions = {
+        # AI variations
+        'ai grant': 'artificial intelligence AI machine learning agentic AI generative AI LLM pioneer',
+        'ai funding': 'artificial intelligence AI machine learning agentic AI generative AI',
+        'show me ai': 'artificial intelligence AI machine learning agentic generative pioneer',
+        'ai': 'artificial intelligence AI machine learning agentic generative',
+        'machine learning': 'machine learning ML AI artificial intelligence neural network',
+        'llm': 'large language model LLM AI artificial intelligence generative',
+
+        # Biotech/health variations
+        'biotech': 'biotechnology biotech life sciences pharmaceutical drug discovery',
+        'medtech': 'medical technology medtech medical device healthcare innovation digital health',
+        'health': 'healthcare health NHS medical clinical patient care',
+        'medical device': 'medical device medtech diagnostic therapeutic healthcare',
+
+        # Business stage
+        'startup': 'startup SME small business entrepreneur innovation',
+        'sme': 'SME small medium enterprise startup business',
+    }
+
+    # Check for expansion matches
+    for key, expansion in expansions.items():
+        if key in query_lower:
+            expanded = f"{query} {expansion}"
+            logger.info(f"Expanded query: '{query}' → '{expanded[:100]}...'")
+            return expanded
+
+    return query
 
 
 # -----------------------------------------------------------------------------
@@ -1405,62 +1610,575 @@ async def chat_with_grants_stream(req: ChatRequest):
                 yield f"data: {json.dumps({'type': 'done'})}\n\n"
             return StreamingResponse(error_generator(), media_type="text/event-stream")
 
-    # Get search hits
-    try:
-        hits = vector_index.query(
-            query_text=query,
-            top_k=20,
-            filter_scope=None
-        )
-    except Exception as e:
-        logger.error(f"Vector search failed: {e}")
-        async def error_generator():
-            yield f"data: {json.dumps({'type': 'token', 'content': 'Search failed unexpectedly. Try rephrasing or asking again in a moment.'})}\n\n"
-            yield f"data: {json.dumps({'type': 'done'})}\n\n"
-        return StreamingResponse(error_generator(), media_type="text/event-stream")
-
-    if not hits:
-        async def no_results_generator():
-            msg = "I don't see anything in the current Innovate UK or NIHR data that clearly matches that. You might need a different funding body or a more general innovation grant."
-            yield f"data: {json.dumps({'type': 'token', 'content': msg})}\n\n"
-            yield f"data: {json.dumps({'type': 'done'})}\n\n"
-        return StreamingResponse(no_results_generator(), media_type="text/event-stream")
-
     # Generate streaming response
     async def generate():
         try:
-            # Step 1: Select top grants
-            grants = select_top_grants(hits, query=query)
+            # Step 0: Check if message contains a URL and parse company website
+            url = extract_url_from_message(query)
+            website_context = ""
+            enhanced_query = query
 
-            # Step 2: Build context
+            if url:
+                logger.info(f"🌐 Detected website URL: {url}")
+                try:
+                    company_info = parse_company_website(url)
+
+                    if company_info:
+                        keywords_str = ', '.join(company_info['keywords']) if company_info['keywords'] else 'AI/tech company'
+                        website_context = f"""
+
+🌐 COMPANY CONTEXT (from {url}):
+- Company: {company_info['title']}
+- Focus: {keywords_str}
+- Stage: {company_info['stage']}
+
+Use this context to personalize grant recommendations specifically for this company."""
+
+                        # Enhance query with website context
+                        if company_info['keywords']:
+                            enhanced_query = f"{query} {' '.join(company_info['keywords'])}"
+                            logger.info(f"✓ Enhanced query with website keywords: {company_info['keywords']}")
+                        else:
+                            logger.warning(f"⚠️ No keywords extracted from {url}")
+                    else:
+                        logger.warning(f"⚠️ parse_company_website returned None for {url}")
+                        website_context = f"\n🌐 Note: User provided website {url} but couldn't parse it automatically.\n"
+
+                except Exception as e:
+                    logger.error(f"❌ Failed to parse website {url}: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    website_context = f"\n🌐 Note: User provided website {url} but couldn't parse it automatically.\n"
+
+            # Step 1: Detect if user wants MORE grants (not details about same grant)
+            query_lower = query.lower()
+            expand_search_indicators = [
+                'anything else', 'what else', 'show me more', 'other grants',
+                'more options', 'what about other', 'are there others',
+                'alternative', 'different grant', 'other opportunities'
+            ]
+            wants_more_grants = any(indicator in query_lower for indicator in expand_search_indicators)
+
+            # Step 2: Resolve references and follow-ups with context locking
+            resolved_query = enhanced_query
+            reference_detected = False
+            locked_on_grant = False  # Track if we're locked onto a specific grant
+            grant_name = None  # Initialize to avoid undefined variable errors
+            last_grants_mentioned = []
+            most_recent_grant = None  # Track the most recently discussed grant
+            max_grants_to_show = 3  # Default
+
+            if wants_more_grants:
+                # User wants to see MORE grants, not details about the current one
+                logger.info("User requesting more grant options - expanding search")
+
+                # Look back to find the ORIGINAL topic/query (not "show me more" queries)
+                original_query = None
+                if req.history:
+                    for msg in reversed(req.history):
+                        if msg.role == "user":
+                            msg_lower = msg.content.lower()
+                            # Skip if it's also a "show me more" type query
+                            if not any(ind in msg_lower for ind in expand_search_indicators):
+                                original_query = msg.content
+                                logger.info(f"✓ Found original query: '{original_query}'")
+                                break
+
+                if original_query:
+                    # Keep the original topic context
+                    resolved_query = original_query
+                    logger.info(f"Expanding search based on original topic: '{resolved_query}'")
+                else:
+                    # Fallback to enhanced query
+                    resolved_query = enhanced_query
+                    logger.info(f"No original query found, using: '{resolved_query}'")
+
+                locked_on_grant = False  # DON'T lock
+                max_grants_to_show = 5  # Show more options
+
+            # Extract grants from recent conversation history
+            elif req.history:
+                last_assistant = None
+                grant_discussion_depth = 0
+
+                # Look through recent history to find grants being discussed
+                for msg in reversed(req.history[-6:]):  # Last 3 exchanges
+                    if msg.role == "assistant":
+                        # SKIP welcome messages and short UI responses
+                        if len(msg.content) < 100:
+                            logger.info(f"Skipping short assistant message (len={len(msg.content)})")
+                            continue
+
+                        # SKIP if it's the generic welcome
+                        if "Hi, I'm Ailsa" in msg.content or "I can help you discover" in msg.content:
+                            logger.info("Skipping welcome message")
+                            continue
+
+                        if not last_assistant:
+                            last_assistant = msg.content
+
+                        grant_discussion_depth += 1
+
+                        # Pattern 1: Grant names with common keywords (Award, Grant, Partnership, Programme, etc.)
+                        grant_matches = re.findall(
+                            r'^(?:#+\s*)?([A-Z][^\n]{15,100}(?:Grant|Award|Partnership|Programme|Catalyst|Fund|Loan|Competition|Prize)[^\n]{0,30}?)(?:\n|$)',
+                            msg.content,
+                            re.MULTILINE | re.IGNORECASE
+                        )
+
+                        # Pattern 2: Extract from structured responses (before colons or from headers)
+                        if not grant_matches:
+                            grant_matches = re.findall(r'(?:^|\n)(?:###?\s+)?([A-Z][^\n:]{10,80})(?:\n|:)', msg.content, re.MULTILINE)
+
+                        if grant_matches:
+                            cleaned = [g.strip() for g in grant_matches[:3]]
+                            if not last_grants_mentioned:
+                                last_grants_mentioned = cleaned
+                            # Track the most recently mentioned grant
+                            if not most_recent_grant:
+                                most_recent_grant = cleaned[0]
+                                logger.info(f"Grant being discussed: {most_recent_grant} (depth: {grant_discussion_depth})")
+
+                        # Break after processing first assistant message for numbered items
+                        if grant_discussion_depth >= 2:  # Look at last 2 assistant messages
+                            break
+
+                # 1A. Handle numbered references (e.g., "number 2", "#3", "the first one")
+                if last_assistant and re.search(r'\b(?:number|#|first|second|third|1st|2nd|3rd)\s*[1-5]?\b', query.lower()):
+                    # Extract numbered items (formats: "1. Grant Name", "**1. Grant Name**", etc.)
+                    numbered_items = re.findall(r'\d+\.\s*\*?\*?([^\n:*]+)', last_assistant)
+
+                    # Find which number user is asking about
+                    number_match = re.search(r'(?:number|#)\s*(\d+)', query.lower())
+                    if not number_match:
+                        # Handle ordinal words
+                        word_to_num = {"first": 1, "1st": 1, "second": 2, "2nd": 2, "third": 3, "3rd": 3, "fourth": 4, "4th": 4, "fifth": 5, "5th": 5}
+                        for word, num in word_to_num.items():
+                            if word in query.lower():
+                                number_match = type('obj', (object,), {'group': lambda x, n=num: n})()
+                                break
+
+                    if number_match and numbered_items:
+                        try:
+                            num = int(number_match.group(1))
+                            if 1 <= num <= len(numbered_items):
+                                grant_name = numbered_items[num - 1].strip()
+                                resolved_query = f"{query} {grant_name}"
+                                reference_detected = True
+                                logger.info(f"✓ Resolved numbered reference: '{query}' → added '{grant_name}'")
+                        except (ValueError, AttributeError):
+                            pass
+
+                # 1B. Detect follow-up questions with typo-tolerant pronoun detection
+                if not reference_detected and most_recent_grant:
+                    query_lower = query.lower()
+
+                    # Comprehensive follow-up indicators (including typos)
+                    follow_up_indicators = [
+                        # Direct references
+                        'this opportunity', 'that opportunity', 'this grant', 'that grant',
+                        'the grant', 'this one', 'that one', 'the opportunity',
+                        'the award', 'the programme', 'the program', 'the fund', 'the loan',
+                        'the competition', 'the prize',
+
+                        # Common typos for "this"
+                        'thus', 'thos', 'thsi', 'thid', 'thius',
+
+                        # Standalone pronouns
+                        'it ', 'this ', 'that ',
+
+                        # Implicit follow-ups (questions that only make sense with context)
+                        'application questions', 'application process', 'application form',
+                        'how do i apply', 'how to apply', 'apply for',
+                        'eligibility', 'who can apply', 'what are the requirements',
+                        'requirements for', 'criteria for',
+                        'deadline', 'when is it due', 'when does it close',
+                        'how much funding', 'funding amount',
+                        'next steps', 'what should i do', 'how does',
+                        'what does', 'tell me more', 'more about'
+                    ]
+
+                    # Check if this is a follow-up question
+                    is_follow_up = any(indicator in query_lower for indicator in follow_up_indicators)
+
+                    # Also check if query starts with question words without context (implicit follow-up)
+                    question_starters = ['what are', 'what is', 'how do', 'how does', 'when is', 'who can']
+                    starts_with_question = any(query_lower.startswith(q) for q in question_starters)
+
+                    if is_follow_up or (starts_with_question and len(query.split()) < 8):
+                        # LOCK ONTO the grant being discussed
+                        grant_name = most_recent_grant
+                        resolved_query = f"{most_recent_grant} {query}"
+                        reference_detected = True
+                        locked_on_grant = True
+                        logger.info(f"🔒 LOCKED onto grant: {most_recent_grant}")
+                        logger.info(f"✓ Follow-up detected: '{query}' → '{resolved_query}'")
+
+                # 1C. Handle vague follow-ups (e.g., "tell me more", "application process", "how do I apply")
+                if not reference_detected and last_grants_mentioned:
+                    followup_patterns = [
+                        "tell me more", "more about", "application process", "how do i apply",
+                        "how to apply", "what about", "eligibility", "who can apply",
+                        "deadline", "next steps", "more details", "more info",
+                        "application questions", "application form", "how does", "what does"
+                    ]
+
+                    if any(pattern in query.lower() for pattern in followup_patterns):
+                        # They're asking about the grant we just discussed
+                        grant_name = last_grants_mentioned[0] if last_grants_mentioned else most_recent_grant
+                        if grant_name:
+                            resolved_query = f"{query} {grant_name}"
+                            reference_detected = True
+                            logger.info(f"✓ Detected follow-up: '{query}' → added '{grant_name}'")
+
+            # Step 2: Check if we have real conversation history (not just welcome message)
+            has_real_history = False
+            if req.history:
+                for msg in req.history:
+                    if msg.role == "assistant" and len(msg.content) > 100 and "Hi, I'm Ailsa" not in msg.content:
+                        has_real_history = True
+                        break
+
+            # Step 3: Contextualize query using conversation history (if not already resolved)
+            if not reference_detected and has_real_history and req.history:
+                # Build context from recent messages, excluding welcome messages
+                recent_context = " ".join([
+                    f"{msg.content[:100]}"
+                    for msg in req.history[-4:]  # Last 2 exchanges
+                    if msg.role == "assistant" and len(msg.content) > 100 and "Hi, I'm Ailsa" not in msg.content
+                ])
+
+                # If the query is short/vague, enrich it with context
+                if len(query.split()) < 10 and recent_context:
+                    resolved_query = f"{query} {recent_context}"
+                    logger.info(f"Contextualized short query with history: {resolved_query[:150]}...")
+            elif not has_real_history:
+                logger.info(f"Fresh query (no real history): '{query}'")
+
+            # Step 4: Expand query for better vector search
+            search_query = expand_query_for_search(resolved_query)
+
+            # Step 5: Perform vector search with expanded query
+            logger.info(f"Vector search query: '{search_query[:100]}...'")
+            try:
+                hits = vector_index.query(
+                    query_text=search_query,
+                    top_k=20,
+                    filter_scope=None
+                )
+            except Exception as e:
+                logger.error(f"Vector search failed: {e}")
+                yield f"data: {json.dumps({'type': 'token', 'content': 'Search failed unexpectedly. Try rephrasing or asking again in a moment.'})}\n\n"
+                yield f"data: {json.dumps({'type': 'done'})}\n\n"
+                return
+
+            logger.info(f"Vector search returned {len(hits)} hits")
+            if hits:
+                logger.info(f"Top 3 scores: {[f'{h.score:.3f}' for h in hits[:3]]}")
+                logger.info(f"Top hit: {hits[0].grant_id if hasattr(hits[0], 'grant_id') else 'unknown'}")
+
+            # CRITICAL: Filter out Smart Grants (paused January 2025)
+            hits_before_filter = len(hits)
+            filtered_hits = []
+            for h in hits:
+                # Get grant details to check title
+                grant = grant_store.get_grant(h.grant_id) if h.grant_id else None
+                if grant:
+                    title_lower = grant.title.lower()
+                    if "smart grant" in title_lower or "smart grants" in title_lower:
+                        logger.info(f"🚫 Filtered out Smart Grant: {grant.title}")
+                        continue
+                filtered_hits.append(h)
+
+            hits = filtered_hits
+            if hits_before_filter != len(hits):
+                logger.info(f"Filtered out {hits_before_filter - len(hits)} Smart Grants, {len(hits)} hits remaining")
+
+            if not hits:
+                msg = "I don't see anything in the current Innovate UK or NIHR data that clearly matches that. You might need a different funding body or a more general innovation grant."
+                yield f"data: {json.dumps({'type': 'token', 'content': msg})}\n\n"
+                yield f"data: {json.dumps({'type': 'done'})}\n\n"
+                return
+
+            # Step 6: Select top grants using resolved/contextualized query
+            # Use dynamic max_grants based on whether user wants more
+            from collections import defaultdict
+
+            # First, get all potential grants
+            all_grants = select_top_grants(hits, query=resolved_query)
+
+            # If user wants more grants, filter out already discussed ones
+            grants = all_grants
+            if wants_more_grants and req.history:
+                already_discussed_titles = set()
+                for msg in req.history:
+                    if msg.role == "assistant":
+                        # Extract grant titles from previous responses
+                        discussed = re.findall(
+                            r'(?:^|\n)(?:###?\s+)?([^\n]{15,100}(?:Grant|Award|Prize|Programme|Catalyst|Fund|Loan|Competition))',
+                            msg.content,
+                            re.MULTILINE | re.IGNORECASE
+                        )
+                        already_discussed_titles.update([d.strip() for d in discussed])
+
+                # Filter out already discussed grants
+                grants_before = len(grants)
+                grants = [g for g in grants if g.get('title') not in already_discussed_titles]
+                logger.info(f"Filtered out {grants_before - len(grants)} already-discussed grants from {len(already_discussed_titles)} total discussed")
+
+            # Limit to max_grants_to_show
+            grants = grants[:max_grants_to_show]
+
+            logger.info(f"Selected {len(grants)} grants to recommend (max: {max_grants_to_show})")
+            if not grants:
+                logger.error(f"⚠️ ZERO GRANTS SELECTED for query: '{query}'")
+                logger.error(f"Original hits: {len(hits)}")
+                if hits:
+                    logger.error(f"Top hit was: grant_id={hits[0].grant_id if hasattr(hits[0], 'grant_id') else 'unknown'}, score={hits[0].score:.3f}")
+
+            # Step 7: Build context
             context = build_llm_context(query, hits, grants)
 
-            # Step 3: Create streaming-specific prompt (outputs MARKDOWN, not JSON!)
+            # Step 6: Create streaming-specific prompt (outputs MARKDOWN, not JSON!)
             grants_list = "\n".join([f"- {g['title']} ({g['source']})" for g in grants[:5]])
 
-            STREAMING_SYSTEM_PROMPT = f"""You are Ailsa, a UK research funding advisor for NIHR and Innovate UK grants.
+            # Build conversation context for the system prompt
+            conversation_context = ""
+            original_topic_for_prompt = None
+
+            if req.history:
+                conversation_context = "\n\nRECENT CONVERSATION:\n"
+
+                # Find the original topic for context
+                for msg in reversed(req.history):
+                    if msg.role == "user":
+                        msg_lower = msg.content.lower()
+                        if not any(ind in msg_lower for ind in expand_search_indicators):
+                            original_topic_for_prompt = msg.content
+                            break
+
+                # Show recent messages
+                for msg in req.history[-4:]:  # Last 2 exchanges
+                    role = "User" if msg.role == "user" else "You (Ailsa)"
+                    content = msg.content[:300]  # Increased to capture more context
+                    conversation_context += f"{role}: {content}...\n"
+
+                # Add original topic context if we're showing more grants
+                if wants_more_grants and original_topic_for_prompt:
+                    conversation_context += f"\n💡 ORIGINAL TOPIC: {original_topic_for_prompt}\n"
+                    conversation_context += "User is asking for MORE options related to this topic. Show additional relevant grants.\n"
+
+                # Add special alert for reference queries and context locking
+                reference_keywords = ["number", "#", "first", "second", "third", "that grant", "it", "the one", "this one", "those"]
+                if any(keyword in query.lower() for keyword in reference_keywords):
+                    conversation_context += "\n⚠️ USER IS REFERENCING SOMETHING FROM YOUR PREVIOUS RESPONSE - check the conversation above.\n"
+                    if reference_detected and grant_name:
+                        conversation_context += f"✓ Reference resolved: User is asking about '{grant_name}'\n"
+
+                # Add context lock indicator when locked onto a specific grant
+                if locked_on_grant and grant_name:
+                    conversation_context += f"\n🔒 CONTEXT LOCKED: User is asking specifically about '{grant_name}'\n"
+                    conversation_context += f"DO NOT switch to other grants. Answer ONLY about {grant_name}.\n"
+                    conversation_context += f"The search results below are filtered for {grant_name}.\n"
+
+            STREAMING_SYSTEM_PROMPT = f"""You are Ailsa, a friendly UK research funding advisor who knows NIHR and Innovate UK grants inside out.
 
 CRITICAL: Output PLAIN MARKDOWN only (NOT JSON!). This will be displayed directly to users as it streams.
+{conversation_context}
+{website_context}
 
-STYLE:
-- Be concise: 300-500 words maximum
-- Start with 1-2 sentence summary
-- Use ## for section headers
-- Use **bold** for emphasis
-- Use bullet lists for key details
-- NO repetition of funding amounts/deadlines (shown in grant cards below)
+---EXPERT RESPONSE STYLE---
 
-STRUCTURE:
-1. Brief summary answering the main question (1-2 sentences)
-2. Top 2-3 relevant grants:
-   - Grant name and why it fits
-   - 2-3 key bullets (eligibility, application tips, strategic advice)
-3. Next steps (2-3 specific actions)
+Learn from these examples of how expert funding advisors respond to clients:
 
-The grants that will be displayed to users in cards below your response:
+EXAMPLE 1: Positioning for a procurement opportunity
+User: Client working on wills/probate tech
+Query: Identifying relevant procurement opportunities
+
+Response style:
+"Tender for Ministry of Justice Probate Document Management
+
+Ailsa's Take: This tender's requested scope around physical document management is a little unimaginative – however, it's best treated as a clear signal that the Ministry of Justice is committing resources to handling the problem.
+
+Why it's a fit: I would suggest you get in touch directly with the procurement manager for this call (asap while he is still processing the PMEQs, but certainly ahead of the tender officially launching next year December 2026) and convert it into a pitch to discuss how your solution could facilitate these or adjacent needs for the Ministry of Justice. Get in early, boldly, and transform their needs.
+
+Next steps: Contact the procurement manager with a brief customised pitch"
+
+EXAMPLE 2: Explaining loan mechanisms with honest assessment
+User: Early-stage company considering innovation loans
+Query: Feasibility of loan funding
+
+Response style:
+"Innovate UK Innovation Loans Round 24
+
+Ailsa's Take: This government-backed loan mechanism supports late stage (TRL6+) development of innovative new products significantly ahead of others currently available, with a clear route to commercialisation. Loans of £100K-£5M over maximum 5 years at 3.7% interest during project period and 7.4% during repayment.
+
+Why it's a fit: We can make a solid case for innovation. The biggest go/no-go factor (apart from this being a repayable loan rather than a grant) is around fiscal position and ability to demonstrate loan repayment capacity. Innovate UK have a dedicated Credit team who assess debt service coverage and liquidity ratios in addition to the typical assessor panel."
+
+EXAMPLE 3: Feasibility grant with specific success metrics
+User: Materials innovation company
+Query: Grant opportunities for feasibility studies
+
+Response style:
+"Innovate UK: National Materials Innovation Programme: Feasibility Studies
+
+Ailsa's Take: A nice tidy grant for £50k-100k feasibility study exercises, with strong anticipated success of 20% – 7.5X better than the last Innovate UK Smart grant round. Projects are capped at 9 months and start by 1st May 2026, with 30% max subcontractor usage.
+
+Why it's a fit: Projects must focus on 1 of 7 themes. Framing will be key here to align with the right theme. They will not fund projects focused on chemical synthesis rather than adoption of materials innovations in end applications.
+
+Next steps: Secure letter of support by [deadline]; application drafting begins by [date]"
+
+---KEY PATTERNS TO FOLLOW---
+
+STRUCTURE (when discussing specific grants):
+- Grant/Opportunity Title (clear and specific)
+- "Ailsa's Take:" - Strategic assessment with insider knowledge
+- "Why it's a fit:" - Client-specific relevance and positioning advice
+- "Next steps:" - Concrete, actionable steps with deadlines when known
+
+TONE & LANGUAGE:
+- Confident and directive: "I would suggest", "Get in early, boldly"
+- Insider knowledge: Reference TRL levels, success rates, program themes, specific criteria
+- Honest about constraints: "The biggest go/no-go factor", "will not fund"
+- Specific numbers: "£50k-100k", "20% success rate", "9 months", "3.7% interest"
+- Strategic framing: "transform their needs", "position for", "snug fit"
+- Natural phrases: "nice tidy grant", "great foot in the door", "snug fit"
+
+WHAT TO INCLUDE:
+- Actual funding amounts and ranges
+- Deadlines and timelines
+- Success rates when known
+- Specific eligibility criteria or constraints
+- Strategic positioning advice (not just "you're eligible")
+- Risk factors or deal-breakers
+- Concrete next steps
+
+WHAT TO AVOID:
+- Generic enthusiasm without specifics
+- Hedging when you have conviction ("This could work" vs "This is a snug fit")
+- Lists of requirements without strategic commentary
+- Vague advice without actionable steps
+
+ADAPT STRUCTURE BASED ON QUERY:
+- Specific grant inquiry → Use full "Ailsa's Take / Why it's a fit / Next steps" structure
+- General questions → Conversational but maintain confident, specific tone
+- Eligibility questions → Honest assessment with specific criteria
+- Strategy questions → Bold, directive positioning advice
+
+Remember: You're a strategic advisor with insider knowledge, not just an information source. Transform needs, position boldly, and be specific with numbers and timelines.
+
+---END EXPERT STYLE GUIDE---
+
+CONVERSATIONAL CONTINUITY & REFERENCES:
+- Pay attention to what you JUST discussed with the user in the conversation above
+- Users will reference your previous responses using "number 2", "the first one", "that grant", etc.
+- When you list grants numbered (1., 2., 3.), remember them for follow-up questions
+
+CONVERSATIONAL MEMORY:
+- Track what grant you JUST discussed in detail (e.g., "Postdoctoral Award (Cohort 2)")
+- When users say "this opportunity", "it", "that grant", "the award", they mean the grant you just explained
+- Don't search broadly when the context is clear - stay focused on the grant being discussed
+- If user asks "what are the application questions for this opportunity?" after discussing Grant X, they mean Grant X
+
+CRITICAL - REQUEST FOR MORE OPTIONS:
+- When user says "anything else?", "what else?", "show me more", "other options" → They want DIFFERENT grants, not the same one again
+- Go back to their ORIGINAL query topic and show additional grants (up to 5)
+- DO NOT repeat grants you already discussed
+- If you've already shown the best matches, be honest: "Those are the top matches. The next options are less relevant, but..."
+
+EXAMPLES:
+✅ CORRECT:
+User: "show me ai grants" → Show Agentic AI Prize
+User: "anything else?" → Show 4 OTHER AI-related grants (exclude Agentic AI Prize)
+
+❌ WRONG:
+User: "show me ai grants" → Show Agentic AI Prize
+User: "anything else?" → Show Agentic AI Prize AGAIN
+
+CRITICAL - CONTEXT LOCKING:
+- Multiple follow-ups in a row all refer to the SAME grant until the user explicitly changes topics
+- When you see 🔒 CONTEXT LOCKED in the conversation above, DO NOT switch to a different grant
+- If locked onto Grant X, ONLY discuss Grant X - ignore other grants in the search results
+- DO NOT say "I found these grants..." when locked - you're answering about ONE specific grant
+
+TYPO HANDLING:
+- "thus" usually means "this" (common typo)
+- "application questions for thus" = "application questions for this grant we're discussing"
+
+Example conversation flow:
+User: "postdoc funding" → List several grants
+User: "tell me more about the first one" → 🔒 LOCK: Discuss Postdoctoral Award
+User: "what are the application questions?" → 🔒 STILL LOCKED: Application questions for Postdoctoral Award
+User: "what about eligibility?" → 🔒 STILL LOCKED: Eligibility for Postdoctoral Award
+User: "tell me about a different grant" → 🔓 UNLOCK: Reset context, search for new grants
+
+LOCKED CONTEXT EXAMPLES:
+✅ CORRECT (when locked on KTP):
+User: "what are the application questions for thus?"
+You: "For Knowledge Transfer Partnership (KTP), the application focuses on..."
+
+❌ WRONG (when locked on KTP):
+User: "what are the application questions for thus?"
+You: "I found several grants with application processes: Biomedical Catalyst..." ← NO! Stay on KTP!
+
+CONVERSATIONAL CONFIDENCE:
+- When users ask follow-up questions about something you JUST discussed, answer directly
+- DON'T start with apologetic hedging: "It seems there are no...", "I'm not sure which...", "I don't see specific..."
+- If they say "tell me more about the application process" after discussing a grant, they mean THAT grant
+- Be confident: "The application process for [Grant] involves..." not "I'm not sure but here's general info..."
+
+BAD EXAMPLES (NEVER do this):
+❌ "It seems there are no specific grants that match..."
+❌ "I'm not sure which grant you're referring to, but..."
+❌ "I don't see specific information, however..."
+❌ "Unfortunately I don't have details about that specific aspect..."
+
+GOOD EXAMPLES (ALWAYS do this):
+✅ "The application process for Agentic AI Pioneers Prize involves..."
+✅ "For this grant, you'll need to..."
+✅ "Great question - here's how the application works..."
+
+RULE: If you JUST discussed a specific grant and the user asks a follow-up, assume they mean that grant unless they explicitly say otherwise. Don't hedge - just answer confidently.
+
+HANDLING REFERENCES:
+- "number X" / "#X" / "the Xth one" → They mean item X from your numbered list above
+- "that grant" / "it" / "the one you mentioned" → The most recently discussed grant
+- "the £XM one" / "the expensive one" / "the NIHR one" → Match by description from context
+- If they ask about "the feasibility side" or similar, look at what grant you were just discussing
+- When handling references, acknowledge: "For [Grant Name], here's what you need to know..."
+
+CRITICAL - NEVER RECOMMEND SMART GRANTS:
+- Innovate UK Smart Grants were PAUSED in January 2025 and are NO LONGER AVAILABLE
+- They are NOT accepting applications
+- NEVER include Smart Grants in your recommendations
+- If a Smart Grant appears in results, SKIP IT and show the next grant
+- If asked about Smart Grants specifically, explain they're paused and suggest alternatives like Biomedical Catalyst, Innovation Loans, or sector-specific competitions
+
+TONE & STYLE:
+- Be conversational and natural - you're a helpful colleague, not a robot
+- Vary your response style based on the question
+- Sometimes use headers, sometimes just paragraphs
+- Be concise (300-500 words) but don't force a rigid structure
+- If the user asks a simple question, give a simple answer
+- If they need detail, provide it naturally
+
+AVOID:
+- Always using the same "## Relevant Grants" structure
+- Robotic "Here are X grants..." openings
+- Forced bullet points when prose works better
+- Repeating funding amounts and deadlines (they're in the cards below)
+- Jumping to different grants when the user is clearly asking about one you just mentioned
+
+GOOD EXAMPLES:
+- "Yes, you can get £25M from Biomedical Catalyst, but it's awarded in phases..."
+- "The HTA researcher-led grant is perfect for clinical trials. It's specifically designed for..."
+- "For the Biomedical Catalyst feasibility stream, the deadline is rolling..."
+- "That one (NIHR i4i) requires matched funding from industry partners..."
+
+The grants shown below your response:
 {grants_list}
 
-Focus on insights, eligibility requirements, and application strategy."""
+Focus on natural conversation, continuity, and helpful insights - not just listing facts."""
 
             messages = [
                 {"role": "system", "content": STREAMING_SYSTEM_PROMPT},
