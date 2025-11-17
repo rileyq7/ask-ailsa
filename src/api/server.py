@@ -89,6 +89,81 @@ chat_llm_client = None
 # Expert Examples Functions
 # -----------------------------------------------------------------------------
 
+def search_expert_knowledge(query: str, limit: int = 5) -> str:
+    """
+    Search expert_examples for relevant knowledge using keyword matching.
+
+    This catches SME knowledge that was ingested via Slack (URLs, resources, etc.)
+
+    Args:
+        query: User's question
+        limit: Max results to return
+
+    Returns:
+        Formatted knowledge context or empty string
+    """
+    # Extract keywords from query
+    keywords = query.lower().split()
+
+    # Add synonyms for common terms
+    expanded_keywords = set(keywords)
+    if 'trl' in query.lower():
+        expanded_keywords.update(['technology', 'readiness', 'level'])
+    if 'link' in query.lower() or 'url' in query.lower():
+        expanded_keywords.update(['http', 'www', 'resource'])
+
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    # Search across all text fields
+    cursor.execute("""
+        SELECT user_query, expert_response, category, grant_mentioned
+        FROM expert_examples
+        WHERE is_active = 1
+        ORDER BY added_date DESC
+        LIMIT 100
+    """)
+
+    results = []
+    for user_query, expert_response, category, grant_mentioned in cursor.fetchall():
+        # Score relevance
+        score = 0
+        combined_text = f"{user_query} {expert_response}".lower()
+
+        for keyword in expanded_keywords:
+            if keyword in combined_text:
+                score += combined_text.count(keyword)
+
+        # Boost URL content when user asks for links
+        if ('link' in query.lower() or 'url' in query.lower()) and 'http' in expert_response:
+            score += 5
+
+        if score > 0:
+            results.append({
+                'score': score,
+                'query': user_query,
+                'response': expert_response,
+                'category': category
+            })
+
+    conn.close()
+
+    if not results:
+        return ""
+
+    # Sort by relevance
+    results.sort(key=lambda x: x['score'], reverse=True)
+
+    # Format top results
+    knowledge_text = "\n\n📚 RELEVANT KNOWLEDGE FROM SME DATABASE:\n"
+    for i, result in enumerate(results[:limit], 1):
+        knowledge_text += f"\n[Resource {i}]:\n{result['response'][:1500]}\n"
+
+    logger.info(f"Found {len(results)} relevant expert examples for: {query[:50]}...")
+
+    return knowledge_text
+
+
 def get_expert_examples(category: str = None, limit: int = 3, min_quality: int = 4):
     """
     Retrieve expert examples from database.
@@ -384,6 +459,84 @@ def apply_semantic_boost(query: str, title: str, base_score: float) -> float:
     return score
 
 
+def should_include_grant_recommendations(query: str, response: str) -> bool:
+    """
+    Determine if we should include grant card recommendations.
+
+    NOT every query needs grant cards! Only show them when genuinely helpful.
+
+    Args:
+        query: User's question
+        response: AI's text response
+
+    Returns:
+        True if grants should be shown, False otherwise
+    """
+    query_lower = query.lower().strip()
+
+    # Meta questions about the bot itself - NO GRANTS
+    meta_patterns = [
+        'do you recommend',
+        'why do you',
+        'every message',
+        'every response',
+        'always show',
+        'stop showing',
+        'how do you work',
+        'what do you do'
+    ]
+    if any(pattern in query_lower for pattern in meta_patterns):
+        logger.info("Meta question detected - skipping grant cards")
+        return False
+
+    # Definition/explanation questions - NO GRANTS (unless specifically about grants)
+    explanation_patterns = [
+        'what is a',
+        'what are',
+        'what does',
+        'explain',
+        'define',
+        'mean by',
+        'tell me about',
+        'what\'s a',
+        'what\'s the'
+    ]
+    if any(pattern in query_lower for pattern in explanation_patterns):
+        # UNLESS they're asking about a specific grant or funding concept
+        grant_related = ['grant', 'funding', 'opportunity', 'nihr', 'innovate uk', 'biomedical']
+        if not any(word in query_lower for word in grant_related):
+            logger.info("General definition question - skipping grant cards")
+            return False
+
+    # Simple acknowledgments - NO GRANTS
+    simple_responses = ['thanks', 'thank you', 'ok', 'okay', 'got it', 'i see', 'understood', 'great', 'cool']
+    if query_lower in simple_responses or len(query.split()) <= 2:
+        logger.info("Simple acknowledgment - skipping grant cards")
+        return False
+
+    # Follow-up clarification questions - NO GRANTS
+    clarification_patterns = ['why', 'how come', 'what do you mean', 'can you explain']
+    if any(pattern in query_lower for pattern in clarification_patterns) and len(query.split()) < 8:
+        logger.info("Clarification question - skipping grant cards")
+        return False
+
+    # Default: Include grants for actual grant-seeking queries
+    grant_seeking_words = [
+        'grant', 'funding', 'opportunity', 'apply', 'deadline',
+        'nihr', 'innovate', 'show me', 'find', 'search',
+        'eligible', 'qualify', 'match', 'suitable'
+    ]
+
+    has_grant_intent = any(word in query_lower for word in grant_seeking_words)
+
+    if has_grant_intent:
+        logger.info("Grant-seeking query detected - including grant cards")
+    else:
+        logger.info("No grant intent detected - skipping grant cards")
+
+    return has_grant_intent
+
+
 def select_top_grants(hits, query: str = ""):
     """
     Filter and deduplicate grants by score threshold with semantic boosting.
@@ -634,6 +787,9 @@ def explain_with_gpt(client, query: str, hits):
     # Step 2: Build context
     context = build_llm_context(query, hits, grants)
 
+    # Step 2.5: Add SME knowledge if relevant
+    expert_knowledge = search_expert_knowledge(query, limit=3)
+
     # Step 3: Call GPT
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -643,6 +799,7 @@ def explain_with_gpt(client, query: str, hits):
                 build_user_prompt(query, grants)
                 + "\n\nContext from grant documents:\n"
                 + context
+                + (f"\n\nExpert Knowledge from SME Database:\n{expert_knowledge}" if expert_knowledge.strip() else "")
             ),
         },
     ]
@@ -2080,8 +2237,9 @@ async def chat_with_grants(req: ChatRequest):
     if chat_llm_client is None:
         try:
             from src.llm.client import LLMClient
-            chat_llm_client = LLMClient(model="gpt-4o-mini")
-            logger.info("✓ Initialized GPT-4o-mini client for /chat")
+            # Use GPT-5.1 Instant by default for better conversational quality
+            chat_llm_client = LLMClient()  # Defaults to gpt-5.1-chat-latest
+            logger.info("✓ Initialized GPT-5.1 Instant client for /chat (Nov 2025 model)")
         except Exception as e:
             logger.error(f"✗ Failed to initialize GPT client: {e}")
             return ChatResponse(
@@ -2126,20 +2284,26 @@ async def chat_with_grants(req: ChatRequest):
         )
 
     # Build response - convert recommended_grants to ChatGrant objects
+    # But only include grants when actually relevant!
     grant_refs = []
-    for g in recommended_grants:
-        grant_refs.append(
-            ChatGrant(
-                grant_id=g.get("grant_id", ""),
-                title=g.get("title", ""),
-                url=g.get("url", "#"),
-                source=g.get("source", ""),
-                is_active=True,  # Default since we're filtering by active
-                total_fund_gbp=g.get("total_fund_gbp"),
-                closes_at=g.get("closes_at"),
-                score=g.get("best_score", 0.0)
+
+    # Smart filtering: Don't show grants for meta/definition/explanation queries
+    should_show_grants = should_include_grant_recommendations(query, answer_markdown)
+
+    if should_show_grants:
+        for g in recommended_grants:
+            grant_refs.append(
+                ChatGrant(
+                    grant_id=g.get("grant_id", ""),
+                    title=g.get("title", ""),
+                    url=g.get("url", "#"),
+                    source=g.get("source", ""),
+                    is_active=True,  # Default since we're filtering by active
+                    total_fund_gbp=g.get("total_fund_gbp"),
+                    closes_at=g.get("closes_at"),
+                    score=g.get("best_score", 0.0)
+                )
             )
-        )
 
     return ChatResponse(answer=answer_markdown, grants=grant_refs[:5])
 
@@ -2181,8 +2345,9 @@ async def chat_with_grants_stream(req: ChatRequest):
     if chat_llm_client is None:
         try:
             from src.llm.client import LLMClient
-            chat_llm_client = LLMClient(model="gpt-4o-mini")
-            logger.info("✓ Initialized GPT-4o-mini client for /chat/stream")
+            # Use GPT-5.1 Instant by default for better conversational quality
+            chat_llm_client = LLMClient()  # Defaults to gpt-5.1-chat-latest
+            logger.info("✓ Initialized GPT-5.1 Instant client for /chat/stream (Nov 2025 model)")
         except Exception as e:
             logger.error(f"✗ Failed to initialize GPT client: {e}")
             async def error_generator():
@@ -2597,7 +2762,14 @@ Example: "Just checked out {company_info['title']} - {company_info.get('sector',
                     conversation_context += f"DO NOT switch to other grants. Answer ONLY about {grant_name}.\n"
                     conversation_context += f"The search results below are filtered for {grant_name}.\n"
 
-            EXPERT_SYSTEM_PROMPT = f"""You are an experienced UK grant consultant. Talk naturally but stay focused.
+            EXPERT_SYSTEM_PROMPT = f"""You are an experienced UK grant consultant named Ailsa. Talk naturally but stay focused.
+
+GPT-5.1 OPTIMIZATION (Nov 2025):
+You're using GPT-5.1 which excels at natural conversation. Lean into your strengths:
+- More natural, flowing responses (not bullet points)
+- Better context retention - never ask for information already provided
+- Warmer, more engaging tone while staying professional
+- No need to repeat or summarize - trust your conversational ability
 
 VOICE RULES:
 - Be conversational but concise - aim for 2-3 solid paragraphs max
@@ -2827,6 +2999,11 @@ Remember: You're chatting with a founder over coffee, not writing a grant databa
 
             user_content += f"RELEVANT GRANT CONTEXT:\n{context}\n\n"
 
+            # Add SME knowledge if relevant
+            expert_knowledge = search_expert_knowledge(query, limit=3)
+            if expert_knowledge.strip():
+                user_content += f"EXPERT KNOWLEDGE FROM SME DATABASE:\n{expert_knowledge}\n\n"
+
             # Add smart follow-up guidance if we generated one
             if smart_followup:
                 user_content += f"💡 Consider ending with this follow-up: {smart_followup}\n\n"
@@ -2921,7 +3098,13 @@ Remember: You're chatting with a founder over coffee, not writing a grant databa
                     })
 
             # Send grants (mentioned grants prioritized)
-            yield f"data: {json.dumps({'type': 'grants', 'grants': enriched_grant_refs})}\n\n"
+            # But only if the query actually warrants grant recommendations
+            should_show_grants = should_include_grant_recommendations(query, full_response)
+
+            if should_show_grants and enriched_grant_refs:
+                yield f"data: {json.dumps({'type': 'grants', 'grants': enriched_grant_refs})}\n\n"
+            else:
+                logger.info(f"Skipping grant cards for query: {query[:50]}...")
 
             # Done
             yield f"data: {json.dumps({'type': 'done'})}\n\n"
