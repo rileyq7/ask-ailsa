@@ -121,17 +121,25 @@ def search_expert_knowledge(query: str, limit: int = 5) -> str:
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
 
-    # Search across all text fields
+    # Search across all text fields, excluding internal Ailsa curations
+    # AILSA INTERNAL content is for tone/voice reference only, not factual information
     cursor.execute("""
         SELECT user_query, expert_response, category, grant_mentioned
         FROM expert_examples
         WHERE is_active = 1
+          AND user_query NOT LIKE '%AILSA INTERNAL%'
+          AND expert_response NOT LIKE '%AILSA INTERNAL%'
+          AND grant_mentioned NOT LIKE '%AILSA INTERNAL%'
         ORDER BY added_date DESC
         LIMIT 100
     """)
 
     results = []
     for user_query, expert_response, category, grant_mentioned in cursor.fetchall():
+        # Double-check: Skip any internal Ailsa content that might have slipped through
+        if 'AILSA INTERNAL' in user_query or 'AILSA INTERNAL' in expert_response:
+            continue
+
         # Score relevance
         score = 0
         combined_text = f"{user_query} {expert_response}".lower()
@@ -177,6 +185,50 @@ def search_expert_knowledge(query: str, limit: int = 5) -> str:
     logger.info(f"Found {len(results)} relevant expert examples for: {query[:50]}...")
 
     return knowledge_text
+
+
+def get_ailsa_tone_examples(limit: int = 2) -> str:
+    """
+    Get AILSA INTERNAL examples for tone/voice reference ONLY.
+
+    These examples show Ailsa's communication style but should NEVER be
+    returned as factual information to users. They are for the LLM to learn
+    the tone, phrasing, and approach - not the specific content.
+
+    Args:
+        limit: Number of tone examples to include
+
+    Returns:
+        Formatted string with tone examples for system prompt
+    """
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    # Get ONLY internal Ailsa curations for tone reference
+    cursor.execute("""
+        SELECT expert_response
+        FROM expert_examples
+        WHERE is_active = 1
+          AND (user_query LIKE '%AILSA INTERNAL%'
+               OR expert_response LIKE '%AILSA INTERNAL%'
+               OR grant_mentioned LIKE '%AILSA INTERNAL%')
+        ORDER BY added_date DESC
+        LIMIT ?
+    """, (limit,))
+
+    examples = cursor.fetchall()
+    conn.close()
+
+    if not examples:
+        return ""
+
+    tone_text = "\n\n🎨 TONE REFERENCE (Internal - for style only, not factual content):\n"
+    for i, (response,) in enumerate(examples, 1):
+        # Truncate to prevent overwhelming the context
+        truncated = response[:800] if len(response) > 800 else response
+        tone_text += f"\n[Example {i} - Ailsa's voice]:\n{truncated}\n"
+
+    return tone_text
 
 
 def get_expert_examples(category: str = None, limit: int = 3, min_quality: int = 4):
